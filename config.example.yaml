@@ -35,3 +35,11 @@ session_ttl: 1800000
 
 # Log level: debug, info, warn, error
 log_level: "info"
+
+# Forward unrecognized HTTP paths to Venice (same method/path/query/body).
+# Default false: unknown paths return 404.
+endpoint_passthru: false
+
+# E2EE chat: forward tools / tool_choice / parallel_tool_calls to Venice.
+# Default false strips them (tool-related SSE deltas are not decrypted by the proxy).
+e2ee_allow_tools: false

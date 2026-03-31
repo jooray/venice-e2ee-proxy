@@ -9,6 +9,13 @@ export interface ProxyConfig {
   venice_base_url: string;
   verify_attestation: boolean;
   enable_dcap: boolean;
+  /** When true, forward unrecognized paths to Venice with the same method, path, query, and body. */
+  endpoint_passthru: boolean;
+  /**
+   * When true, forward `tools`, `tool_choice`, and `parallel_tool_calls` on E2EE chat requests.
+   * Default false strips them (tool-related response fields are not decrypted by the proxy).
+   */
+  e2ee_allow_tools: boolean;
   session_ttl: number;
   log_level: 'debug' | 'info' | 'warn' | 'error';
 }
@@ -19,6 +26,8 @@ const DEFAULTS: Omit<ProxyConfig, 'venice_api_key'> = {
   venice_base_url: 'https://api.venice.ai',
   verify_attestation: true,
   enable_dcap: true,
+  endpoint_passthru: false,
+  e2ee_allow_tools: false,
   session_ttl: 30 * 60 * 1000, // 30 minutes
   log_level: 'info',
 };
@@ -55,6 +64,14 @@ export function loadConfig(configPath?: string): ProxyConfig {
   }
   if (process.env.ENABLE_DCAP !== undefined) {
     envOverrides.enable_dcap = process.env.ENABLE_DCAP === 'true' || process.env.ENABLE_DCAP === '1';
+  }
+  if (process.env.ENDPOINT_PASSTHRU !== undefined) {
+    envOverrides.endpoint_passthru =
+      process.env.ENDPOINT_PASSTHRU === 'true' || process.env.ENDPOINT_PASSTHRU === '1';
+  }
+  if (process.env.E2EE_ALLOW_TOOLS !== undefined) {
+    envOverrides.e2ee_allow_tools =
+      process.env.E2EE_ALLOW_TOOLS === 'true' || process.env.E2EE_ALLOW_TOOLS === '1';
   }
   if (process.env.SESSION_TTL) envOverrides.session_ttl = parseInt(process.env.SESSION_TTL, 10);
   if (process.env.LOG_LEVEL) envOverrides.log_level = process.env.LOG_LEVEL;

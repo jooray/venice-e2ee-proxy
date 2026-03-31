@@ -92,6 +92,39 @@ npm run build
 npm start
 ```
 
+## Running with Docker
+
+You need [Docker](https://docs.docker.com/get-docker/) and Docker Compose (v2: `docker compose`). Only `docker-compose.yml` is versioned; name any custom file differently (for example `docker-compose.local.yml`) and point Compose at it with `docker compose -f …`.
+
+1. Copy and edit environment variables:
+
+   ```bash
+   cp .env.example .env
+   # Set VENICE_API_KEY (required)
+   ```
+
+2. Build and start the container:
+
+   ```bash
+   docker compose up -d --build
+   ```
+
+The image is built from the `Dockerfile` in this repo. If `VENICE_PROXY_REF` is not set, the build uses **`main`** (whatever tip is at clone time). Set `VENICE_PROXY_REF` to a branch name, tag, or full commit SHA when you want a specific revision or a reproducible image. You can also set `VENICE_PROXY_REPO` to clone from a fork.
+
+Inside the container the proxy listens on `0.0.0.0`. Compose maps it to the host as `127.0.0.1:<port>:<port>` only (not exposed on all interfaces). Set `PORT` to change the listen and publish port (default `3000`).
+
+Check health:
+
+```bash
+curl http://127.0.0.1:3000/health
+```
+
+Stop:
+
+```bash
+docker compose down
+```
+
 ## Configuration
 
 Configuration is loaded from `config.yaml` (optional) with environment variable overrides. `.env` is loaded automatically at startup. Copy the example to get started:
@@ -114,6 +147,8 @@ cp .env.example .env
 | `ENABLE_DCAP` | `true` | Full DCAP quote verification |
 | `SESSION_TTL` | `1800000` | Session TTL in ms (default: 30 min) |
 | `LOG_LEVEL` | `info` | Log level: debug, info, warn, error |
+| `ENDPOINT_PASSTHRU` | `false` | When `true` or `1`, forward any request that does not match a built-in route to Venice using the same method, path, query string, and body. Uses the proxy’s API key (`Authorization` from the client is replaced). Venice’s status code and body are returned as-is. Network failures still yield a `502` from the proxy. |
+| `E2EE_ALLOW_TOOLS` | `false` | When `true` or `1`, forward `tools`, `tool_choice`, and `parallel_tool_calls` on E2EE (`e2ee-*`) chat completions. Default strips them: many models do not support tools under E2EE, and tool-related content in the assistant reply is not decrypted by this proxy. |
 
 ### config.yaml
 
@@ -123,6 +158,8 @@ host: "127.0.0.1"
 venice_base_url: "https://api.venice.ai"
 verify_attestation: true
 enable_dcap: true
+endpoint_passthru: false
+e2ee_allow_tools: false
 session_ttl: 1800000
 log_level: "info"
 ```
@@ -158,7 +195,9 @@ enable_dcap: false
 
 ### E2EE Models
 
-Send requests with models prefixed with `e2ee-`. The proxy will handle encryption/decryption transparently:
+Send requests with models prefixed with `e2ee-`. The proxy will handle encryption/decryption transparently.
+
+By default, **tool-calling parameters** (`tools`, `tool_choice`, `parallel_tool_calls`) are removed before the request is sent to Venice, because tool-related assistant output is not decrypted in the streaming path. To experiment with tools anyway, set `e2ee_allow_tools: true` in `config.yaml` or `E2EE_ALLOW_TOOLS=true` in the environment (see [Configuration](#configuration)).
 
 ```bash
 # Streaming (default)
@@ -216,11 +255,16 @@ curl http://127.0.0.1:3000/health
 
 ### API Compatibility
 
-The proxy exposes a standard OpenAI-compatible API on both endpoints:
+Standard OpenAI-compatible API:
+
 - `POST /v1/chat/completions`
 - `POST /chat/completions`
+- `GET /v1/models`
+- `GET /models`
 
-This means it works with any OpenAI-compatible client library. Just point it at the proxy:
+Any other path returns **404** unless `ENDPOINT_PASSTHRU` is enabled (see environment variables): then unmatched requests are forwarded to `VENICE_BASE_URL` with the same path and query (for example `GET /api/v1/...` on the proxy becomes `GET https://api.venice.ai/api/v1/...` when using the default base URL).
+
+Use any OpenAI-compatible client library with `base_url` pointing at the proxy:
 
 ```python
 # Python (openai library)

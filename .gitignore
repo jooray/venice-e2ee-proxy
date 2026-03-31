@@ -21,3 +21,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Compose: only docker-compose.yml is tracked; use another name for local overrides
+docker-compose*.yml
+docker-compose*.yaml
+!docker-compose.yml

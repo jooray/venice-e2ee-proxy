@@ -17,11 +17,13 @@ interface ChatCompletionRequest {
 }
 
 /**
- * Core proxy handler for /v1/chat/completions.
+ * Core proxy handler for chat completions and models listing.
  *
- * Routes:
+ * Chat completions:
  * - E2EE models (e2ee-*): encrypt messages, forward to Venice, decrypt response
  * - Non-E2EE models: transparently forward with Authorization header
+ *
+ * GET /v1/models: forward to Venice `/api/v1/models` with the proxy API key.
  */
 export class ProxyHandler {
   private sessionManager: SessionManager;
@@ -72,15 +74,24 @@ export class ProxyHandler {
       const { encryptedMessages, headers: e2eeHeaders, veniceParameters } = await instance.encrypt(body.messages, session);
 
       // 3. Build Venice request
-      // Strip tool-related params — E2EE models generally don't support function calling,
-      // and even if they did, tool_calls in responses aren't decrypted by the proxy.
-      const { tools, tool_choice, parallel_tool_calls, ...bodyWithoutTools } = body as Record<string, unknown>;
-      if (tools || tool_choice || parallel_tool_calls) {
-        logger.warn(`Stripping unsupported params from E2EE request: ${[tools && 'tools', tool_choice && 'tool_choice', parallel_tool_calls && 'parallel_tool_calls'].filter(Boolean).join(', ')}`);
+      const bodyRecord = body as Record<string, unknown>;
+      let forwardFields: Record<string, unknown>;
+      if (this.config.e2ee_allow_tools) {
+        forwardFields = { ...bodyRecord };
+      } else {
+        // Strip tool-related params by default — many E2EE models don't support function calling,
+        // and tool_calls in responses aren't decrypted by the proxy.
+        const { tools, tool_choice, parallel_tool_calls, ...bodyWithoutTools } = bodyRecord;
+        if (tools || tool_choice || parallel_tool_calls) {
+          logger.warn(
+            `Stripping unsupported params from E2EE request: ${[tools && 'tools', tool_choice && 'tool_choice', parallel_tool_calls && 'parallel_tool_calls'].filter(Boolean).join(', ')}`
+          );
+        }
+        forwardFields = bodyWithoutTools;
       }
 
       const veniceBody: Record<string, unknown> = {
-        ...bodyWithoutTools,
+        ...forwardFields,
         messages: encryptedMessages,
         stream: true, // always stream from Venice (we decrypt chunks)
         venice_parameters: {
@@ -398,6 +409,117 @@ export class ProxyHandler {
       const message = err instanceof Error ? err.message : String(err);
       logger.error(`Passthrough request failed: ${message}`);
       res.status(502).json({ error: { message: `Proxy error: ${message}`, type: 'proxy_error' } });
+    }
+  }
+
+  /**
+   * Forward any request to the same path and query on Venice (uses proxy API key).
+   * Used when ENDPOINT_PASSTHRU is enabled for routes not handled above.
+   */
+  async handleVeniceEndpointPassthru(req: Request, res: Response): Promise<void> {
+    const base = this.config.venice_base_url.replace(/\/$/, '');
+    const veniceUrl = `${base}${req.originalUrl}`;
+    logger.info(`Endpoint passthru ${req.method} ${req.originalUrl}`);
+
+    const skipRequestHeaders = new Set([
+      'host',
+      'connection',
+      'content-length',
+      'transfer-encoding',
+      'authorization',
+    ]);
+
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.config.venice_api_key}`,
+    };
+
+    for (const [key, value] of Object.entries(req.headers)) {
+      if (skipRequestHeaders.has(key.toLowerCase())) continue;
+      if (value === undefined) continue;
+      headers[key] = Array.isArray(value) ? value.join(', ') : value;
+    }
+
+    const method = req.method.toUpperCase();
+    const hasBody = !['GET', 'HEAD', 'DELETE', 'CONNECT', 'TRACE'].includes(method);
+
+    const init: RequestInit = { method, headers };
+
+    if (hasBody) {
+      const rawBody = (req as Request & { rawBody?: Buffer }).rawBody;
+      if (rawBody !== undefined) {
+        init.body = new Uint8Array(rawBody);
+      } else if (req.body !== undefined) {
+        init.body = JSON.stringify(req.body);
+        if (!headers['content-type'] && !headers['Content-Type']) {
+          headers['Content-Type'] = 'application/json';
+        }
+      }
+    }
+
+    try {
+      const veniceRes = await fetch(veniceUrl, init);
+
+      res.status(veniceRes.status);
+      veniceRes.headers.forEach((value, key) => {
+        const lower = key.toLowerCase();
+        if (['transfer-encoding', 'connection', 'keep-alive'].includes(lower)) return;
+        res.setHeader(key, value);
+      });
+
+      if (!veniceRes.body) {
+        const text = await veniceRes.text();
+        res.send(text);
+        return;
+      }
+
+      const reader = veniceRes.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+      res.end();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error(`Endpoint passthru failed: ${message}`);
+      if (!res.headersSent) {
+        res.status(502).json({ error: { message: `Proxy error: ${message}`, type: 'proxy_error' } });
+      }
+    }
+  }
+
+  /**
+   * Proxy GET /v1/models to Venice's OpenAI-compatible models list.
+   */
+  async handleModels(req: Request, res: Response): Promise<void> {
+    const queryIndex = req.originalUrl.indexOf('?');
+    const query = queryIndex >= 0 ? req.originalUrl.slice(queryIndex) : '';
+    const veniceUrl = `${this.config.venice_base_url}/api/v1/models${query}`;
+
+    try {
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${this.config.venice_api_key}`,
+      };
+      if (req.headers['accept']) headers['Accept'] = req.headers['accept'] as string;
+
+      const veniceRes = await fetch(veniceUrl, { method: 'GET', headers });
+
+      res.status(veniceRes.status);
+      const contentType = veniceRes.headers.get('content-type');
+      if (contentType) res.setHeader('Content-Type', contentType);
+
+      const text = await veniceRes.text();
+      res.send(text);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error(`Models list request failed: ${message}`);
+      if (!res.headersSent) {
+        res.status(502).json({ error: { message: `Proxy error: ${message}`, type: 'proxy_error' } });
+      }
     }
   }
 }

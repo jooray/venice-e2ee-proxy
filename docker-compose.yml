@@ -1,0 +1,21 @@
+# From this directory: docker compose up -d --build
+# Copy .env.example to .env and set VENICE_API_KEY.
+# Optional: VENICE_PROXY_REF — branch, tag, or commit SHA (default: main = latest at build time).
+
+services:
+  venice-e2ee-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VENICE_PROXY_REPO: ${VENICE_PROXY_REPO:-https://github.com/jooray/venice-e2ee-proxy.git}
+        VENICE_PROXY_REF: ${VENICE_PROXY_REF:-main}
+    container_name: venice-e2ee-proxy
+    env_file:
+      - .env
+    environment:
+      HOST: "0.0.0.0"
+      PORT: ${PORT:-3000}
+    ports:
+      - "127.0.0.1:${PORT:-3000}:${PORT:-3000}"
+    restart: unless-stopped
