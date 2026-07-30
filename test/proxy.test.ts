@@ -460,6 +460,207 @@ describe('E2EE request handling', () => {
   });
 });
 
+describe('E2EE function calling', () => {
+  let mockVenice: http.Server;
+  let proxyServer: http.Server;
+  let sessionManager: ReturnType<typeof createServer>['sessionManager'];
+  let lastReceivedBody: any;
+  /** Chunks the mock TEE emits as assistant content (plaintext passes through decryptChunk). */
+  let responseChunks: string[] = [];
+
+  const weatherTool = {
+    type: 'function',
+    function: {
+      name: 'get_weather',
+      description: 'Get the current weather in a given city',
+      parameters: {
+        type: 'object',
+        properties: { city: { type: 'string' } },
+        required: ['city'],
+      },
+    },
+  };
+
+  beforeAll(async () => {
+    mockVenice = http.createServer((req, res) => {
+      if (req.method === 'GET' && req.url?.startsWith('/api/v1/tee/attestation')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          verified: true,
+          nonce: new URL(`http://localhost${req.url}`).searchParams.get('nonce'),
+          model: 'e2ee-glm-5-2-p',
+          signing_key: mockTeeKeypair.pubKeyHex,
+        }));
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/api/v1/chat/completions') {
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', () => {
+          lastReceivedBody = JSON.parse(body);
+          res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+          for (const chunk of responseChunks) {
+            res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: chunk }, finish_reason: null }] })}\n\n`);
+          }
+          res.write('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n');
+          res.write('data: [DONE]\n\n');
+          res.end();
+        });
+        return;
+      }
+
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise<void>(resolve => mockVenice.listen(0, '127.0.0.1', resolve));
+
+    const mockAddress = mockVenice.address() as { port: number };
+    const config = testConfig({
+      venice_base_url: `http://127.0.0.1:${mockAddress.port}`,
+      verify_attestation: false,
+    });
+    const result = createServer(config);
+    sessionManager = result.sessionManager;
+    proxyServer = result.app.listen(0, '127.0.0.1');
+    await new Promise<void>(resolve => proxyServer.once('listening', resolve));
+  });
+
+  afterAll(async () => {
+    sessionManager.destroy();
+    await Promise.all([
+      new Promise<void>(resolve => proxyServer.close(() => resolve())),
+      new Promise<void>(resolve => mockVenice.close(() => resolve())),
+    ]);
+  });
+
+  it('never sends tool schemas to Venice in plaintext', async () => {
+    responseChunks = ['ok'];
+    await request(proxyServer, 'POST', '/v1/chat/completions', {
+      model: 'e2ee-glm-5-2-p',
+      messages: [{ role: 'user', content: 'Weather in Bratislava?' }],
+      tools: [weatherTool],
+      tool_choice: 'auto',
+    });
+
+    // The plaintext tool params must not survive into the upstream request...
+    expect(lastReceivedBody.tools).toBeUndefined();
+    expect(lastReceivedBody.tool_choice).toBeUndefined();
+    // ...and no tool name or description may appear anywhere in the body.
+    const wire = JSON.stringify(lastReceivedBody);
+    expect(wire).not.toContain('get_weather');
+    expect(wire).not.toContain('Get the current weather');
+    expect(wire).not.toContain('Bratislava');
+  });
+
+  it('carries the tool schemas in an encrypted system message', async () => {
+    responseChunks = ['ok'];
+    await request(proxyServer, 'POST', '/v1/chat/completions', {
+      model: 'e2ee-glm-5-2-p',
+      messages: [{ role: 'user', content: 'Hello' }],
+      tools: [weatherTool],
+    });
+
+    // A system turn is prepended, and every message is ciphertext.
+    expect(lastReceivedBody.messages[0].role).toBe('system');
+    for (const msg of lastReceivedBody.messages) {
+      expect(msg.content).toMatch(/^[0-9a-f]+$/);
+    }
+  });
+
+  it('parses a tool call out of the response (non-streaming)', async () => {
+    responseChunks = ['<tool_call>\n{"name":"get_weather","arguments":{"city":"Bratislava"}}\n</tool_call>'];
+    const res = await request(proxyServer, 'POST', '/v1/chat/completions', {
+      model: 'e2ee-glm-5-2-p',
+      messages: [{ role: 'user', content: 'Weather?' }],
+      tools: [weatherTool],
+    });
+
+    const body = JSON.parse(res.body);
+    expect(body.choices[0].finish_reason).toBe('tool_calls');
+    expect(body.choices[0].message.content).toBeNull();
+    const calls = body.choices[0].message.tool_calls;
+    expect(calls).toHaveLength(1);
+    expect(calls[0].function.name).toBe('get_weather');
+    expect(JSON.parse(calls[0].function.arguments)).toEqual({ city: 'Bratislava' });
+  });
+
+  it('emits tool calls as OpenAI SSE deltas when streaming', async () => {
+    responseChunks = ['Checking. ', '<tool_call>\n{"name":"get_wea', 'ther","arguments":{"city":"Nitra"}}\n</tool_call>'];
+    const result = await streamRequest(proxyServer, '/v1/chat/completions', {
+      model: 'e2ee-glm-5-2-p',
+      messages: [{ role: 'user', content: 'Weather?' }],
+      tools: [weatherTool],
+      stream: true,
+    });
+
+    const events = result.events.filter(e => e !== '[DONE]').map(e => JSON.parse(e));
+    const toolDeltas = events.flatMap(e => e.choices?.[0]?.delta?.tool_calls || []);
+    expect(toolDeltas).toHaveLength(1);
+    expect(toolDeltas[0].index).toBe(0);
+    expect(toolDeltas[0].function.name).toBe('get_weather');
+
+    // Prose before the block still reaches the client, and the tag never leaks.
+    const text = events.map(e => e.choices?.[0]?.delta?.content || '').join('');
+    expect(text).toBe('Checking. ');
+    expect(events.some(e => e.choices?.[0]?.finish_reason === 'tool_calls')).toBe(true);
+  });
+
+  it('encrypts tool results sent back by the client', async () => {
+    responseChunks = ['It is raining.'];
+    const res = await request(proxyServer, 'POST', '/v1/chat/completions', {
+      model: 'e2ee-glm-5-2-p',
+      messages: [
+        { role: 'user', content: 'Weather?' },
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'get_weather', arguments: '{"city":"Bratislava"}' } }],
+        },
+        { role: 'tool', tool_call_id: 'call_1', content: '{"temp":19}' },
+      ],
+      tools: [weatherTool],
+    });
+
+    expect(res.status).toBe(200);
+    // The assistant's tool_calls must not ride along as plaintext metadata.
+    const assistant = lastReceivedBody.messages.find((m: any) => m.role === 'assistant');
+    expect(assistant.tool_calls).toBeUndefined();
+    expect(JSON.stringify(lastReceivedBody)).not.toContain('temp');
+    // The tool turn survives as an encrypted message.
+    expect(lastReceivedBody.messages.some((m: any) => m.role === 'tool')).toBe(true);
+
+    expect(JSON.parse(res.body).choices[0].message.content).toBe('It is raining.');
+  });
+
+  it('does not offer tools when tool_choice is none', async () => {
+    responseChunks = ['no tools used'];
+    await request(proxyServer, 'POST', '/v1/chat/completions', {
+      model: 'e2ee-glm-5-2-p',
+      messages: [{ role: 'user', content: 'Hello' }],
+      tools: [weatherTool],
+      tool_choice: 'none',
+    });
+
+    // No system prompt is injected, so only the original user turn is sent.
+    expect(lastReceivedBody.messages).toHaveLength(1);
+    expect(lastReceivedBody.messages[0].role).toBe('user');
+  });
+
+  it('leaves tool_call markup alone when the request has no tools', async () => {
+    responseChunks = ['<tool_call>\n{"name":"x","arguments":{}}\n</tool_call>'];
+    const res = await request(proxyServer, 'POST', '/v1/chat/completions', {
+      model: 'e2ee-glm-5-2-p',
+      messages: [{ role: 'user', content: 'Print a tool_call example' }],
+    });
+
+    const body = JSON.parse(res.body);
+    expect(body.choices[0].message.tool_calls).toBeUndefined();
+    expect(body.choices[0].message.content).toContain('<tool_call>');
+    expect(body.choices[0].finish_reason).toBe('stop');
+  });
+});
+
 describe('E2EE with Venice error responses', () => {
   let mockVenice: http.Server;
   let proxyServer: http.Server;

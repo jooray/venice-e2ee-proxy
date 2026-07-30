@@ -33,6 +33,8 @@ The proxy handles:
 - **Optional full DCAP verification** (PCK certificate chain, quote signatures, TCB evaluation)
 - **AES-256-GCM encryption** of all messages
 - **Per-chunk decryption** of streaming responses (each chunk uses a fresh server ephemeral key)
+- **Function calling** over E2EE, with tool schemas and arguments kept encrypted ([details](#function-calling))
+- **Reasoning content** decryption for reasoning models (`reasoning_content`)
 - **Session caching** with configurable TTL (default 30 minutes)
 - **Parallel request handling** (sessions are safely shared across concurrent requests)
 
@@ -161,7 +163,7 @@ enable_dcap: false
 Send requests with models prefixed with `e2ee-`. The proxy will handle encryption/decryption transparently:
 
 ```bash
-# Streaming (default)
+# Streaming
 curl http://127.0.0.1:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -170,15 +172,95 @@ curl http://127.0.0.1:3000/v1/chat/completions \
     "stream": true
   }'
 
-# Non-streaming
+# Non-streaming (the default, as in the OpenAI API)
 curl http://127.0.0.1:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "e2ee-qwen3-30b-a3b-p",
-    "messages": [{"role": "user", "content": "What is the meaning of life?"}],
-    "stream": false
+    "messages": [{"role": "user", "content": "What is the meaning of life?"}]
   }'
 ```
+
+Reasoning models additionally return decrypted `reasoning_content` (as a delta field when
+streaming, on the message when not).
+
+### Function Calling
+
+Pass `tools` and `tool_choice` exactly as you would with the OpenAI API. Only models
+advertising `supportsFunctionCalling` can use them — `e2ee-glm-5-2-p`,
+`e2ee-deepseek-v4-flash`, `e2ee-qwen3-30b-a3b-p` and a few others; check
+`https://api.venice.ai/api/v1/models?type=text`.
+
+```bash
+curl http://127.0.0.1:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "e2ee-glm-5-2-p",
+    "messages": [{"role": "user", "content": "What is the weather in Bratislava?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather in a given city",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string"}},
+          "required": ["city"]
+        }
+      }
+    }]
+  }'
+```
+
+You get back a standard OpenAI tool call, and feed the result back with a `tool` message
+as usual:
+
+```json
+{
+  "choices": [{
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{
+        "id": "call_65757dda1acabfe0648fdc41",
+        "type": "function",
+        "function": {"name": "get_weather", "arguments": "{\"city\":\"Bratislava\"}"}
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}
+```
+
+Streaming works too: tool calls arrive as `delta.tool_calls` followed by a
+`finish_reason: "tool_calls"` chunk.
+
+**How it works — and why your tools stay private.** Venice's E2EE gateway drops the
+`tools` request parameter: a request carrying encrypted messages reaches the model with no
+tool schemas attached. (The same model returns native tool calls when the E2EE headers are
+absent, so this is a property of the encrypted path, not the model.) Passing `tools`
+through would therefore have been the worst of both worlds — the model would ignore your
+tools while their names, descriptions and JSON schemas travelled to Venice in plaintext.
+
+So the proxy moves function calling inside the encrypted channel:
+
+- Tool schemas are rendered into a system message and encrypted with the rest of the
+  conversation.
+- The model's emitted `<tool_call>` blocks are parsed out of the decrypted stream and
+  converted back into OpenAI `tool_calls`.
+- Prior `tool_calls` and `tool` results in your message history are folded into encrypted
+  message content, and the plaintext `tool_calls` field is dropped before the request
+  leaves the proxy.
+
+Venice sees only ciphertext — tool names, descriptions, arguments and results included.
+The test suite asserts that none of them appear in the outgoing request.
+
+Two consequences worth knowing:
+
+- Tool calling is prompt-driven rather than constrained decoding, so a model can in
+  principle emit a malformed call. Validate arguments before acting on them, as you would
+  with any model.
+- Requests carrying tools cost some extra prompt tokens for the injected schemas.
 
 ### Non-E2EE Models (Passthrough)
 
@@ -236,6 +318,43 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "Hello!"}],
 )
 print(response.choices[0].message.content)
+```
+
+Function calling uses the ordinary OpenAI tool loop:
+
+```python
+import json
+
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the current weather in a given city",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    },
+}]
+
+messages = [{"role": "user", "content": "What's the weather in Bratislava?"}]
+
+response = client.chat.completions.create(
+    model="e2ee-glm-5-2-p", messages=messages, tools=tools
+)
+msg = response.choices[0].message
+messages.append(msg.model_dump(exclude_none=True))
+
+for call in msg.tool_calls or []:
+    args = json.loads(call.function.arguments)
+    result = json.dumps({"temp": 19, "conditions": "light rain"})  # your function here
+    messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+
+final = client.chat.completions.create(
+    model="e2ee-glm-5-2-p", messages=messages, tools=tools
+)
+print(final.choices[0].message.content)
 ```
 
 ## Testing

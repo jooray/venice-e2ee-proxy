@@ -2,16 +2,23 @@ import type { Request, Response } from 'express';
 import type { ProxyConfig } from './config.js';
 import { SessionManager } from './session-manager.js';
 import { logger } from './logger.js';
-
-interface ChatMessage {
-  role: string;
-  content: string;
-}
+import {
+  buildToolSystemPrompt,
+  renderToolMessages,
+  ToolCallStreamParser,
+  type ToolCall,
+  type ToolChatMessage,
+  type ToolChoice,
+  type ToolDefinition,
+} from 'venice-e2ee';
 
 interface ChatCompletionRequest {
   model: string;
-  messages: ChatMessage[];
+  messages: ToolChatMessage[];
   stream?: boolean;
+  tools?: ToolDefinition[];
+  tool_choice?: ToolChoice;
+  parallel_tool_calls?: boolean;
   venice_parameters?: Record<string, unknown>;
   [key: string]: unknown;
 }
@@ -60,7 +67,9 @@ export class ProxyHandler {
    */
   private async handleE2EERequest(body: ChatCompletionRequest, res: Response, retried = false): Promise<void> {
     const modelId = body.model;
-    const wantStream = body.stream !== false; // default to streaming
+    // OpenAI semantics: `stream` defaults to false. Clients that aren't streaming
+    // omit the field entirely, so defaulting to true here would hand them SSE text.
+    const wantStream = body.stream === true;
 
     try {
       // 1. Get or create E2EE session
@@ -68,19 +77,34 @@ export class ProxyHandler {
       const { session, instance } = await this.sessionManager.getSession(modelId);
       logger.info(`E2EE ${modelId} | attestation: ${session.attestation ? 'verified' : 'skipped'}`);
 
-      // 2. Encrypt messages
-      const { encryptedMessages, headers: e2eeHeaders, veniceParameters } = await instance.encrypt(body.messages, session);
+      // 2. Move function calling into the encrypted channel.
+      //
+      // Venice's E2EE gateway silently drops the `tools` parameter, so passing it
+      // through would leave the model unaware of the tools while leaking their
+      // schemas in plaintext. Instead the schemas and the tool-call history are
+      // rendered into message content and encrypted with everything else, and the
+      // model's `<tool_call>` blocks are parsed back out of the decrypted stream.
+      const { tools, tool_choice, parallel_tool_calls, ...restBody } = body as ChatCompletionRequest;
+      const toolPrompt = tools?.length ? buildToolSystemPrompt(tools, tool_choice ?? 'auto') : null;
 
-      // 3. Build Venice request
-      // Strip tool-related params — E2EE models generally don't support function calling,
-      // and even if they did, tool_calls in responses aren't decrypted by the proxy.
-      const { tools, tool_choice, parallel_tool_calls, ...bodyWithoutTools } = body as Record<string, unknown>;
-      if (tools || tool_choice || parallel_tool_calls) {
-        logger.warn(`Stripping unsupported params from E2EE request: ${[tools && 'tools', tool_choice && 'tool_choice', parallel_tool_calls && 'parallel_tool_calls'].filter(Boolean).join(', ')}`);
+      let messages = renderToolMessages(body.messages);
+      if (toolPrompt) {
+        // Merge into an existing leading system message so models that only honour
+        // the first system turn still see the schemas.
+        if (messages[0]?.role === 'system') {
+          messages = [{ ...messages[0], content: `${messages[0].content}\n\n${toolPrompt}` }, ...messages.slice(1)];
+        } else {
+          messages = [{ role: 'system', content: toolPrompt }, ...messages];
+        }
+        logger.debug(`Injected ${tools!.length} tool schema(s) into the encrypted prompt`);
       }
 
+      // 3. Encrypt every message (the TEE rejects any plaintext content)
+      const { encryptedMessages, headers: e2eeHeaders, veniceParameters } = await instance.encrypt(messages, session);
+
+      // 4. Build Venice request
       const veniceBody: Record<string, unknown> = {
-        ...bodyWithoutTools,
+        ...restBody,
         messages: encryptedMessages,
         stream: true, // always stream from Venice (we decrypt chunks)
         venice_parameters: {
@@ -114,11 +138,11 @@ export class ProxyHandler {
         return;
       }
 
-      // 4. Decrypt and forward response
+      // 5. Decrypt and forward response
       if (wantStream) {
-        await this.streamE2EEResponse(veniceRes, session, instance, res);
+        await this.streamE2EEResponse(veniceRes, session, res, !!toolPrompt);
       } else {
-        await this.collectE2EEResponse(veniceRes, session, instance, res);
+        await this.collectE2EEResponse(veniceRes, session, res, !!toolPrompt);
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
@@ -145,26 +169,12 @@ export class ProxyHandler {
   }
 
   /**
-   * Stream decrypted E2EE response as standard OpenAI SSE events.
+   * Iterate Venice's SSE events, yielding each parsed JSON payload.
    */
-  private async streamE2EEResponse(
-    veniceRes: globalThis.Response,
-    session: { privateKey: Uint8Array; modelId: string },
-    instance: { decryptStream: (body: ReadableStream<Uint8Array>, session: any) => AsyncGenerator<string> },
-    res: Response
-  ): Promise<void> {
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders();
-
-    // We need to parse Venice's SSE ourselves to decrypt and re-emit
+  private async *iterateVeniceEvents(veniceRes: globalThis.Response): AsyncGenerator<any> {
     const reader = veniceRes.body!.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-    let chunkIndex = 0;
-    const responseId = `chatcmpl-${Date.now().toString(36)}`;
 
     try {
       while (true) {
@@ -178,70 +188,143 @@ export class ProxyHandler {
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue;
           const data = line.slice(6).trim();
-
-          if (data === '[DONE]') {
-            res.write('data: [DONE]\n\n');
-            res.end();
-            return;
-          }
-
-          let event: any;
+          if (data === '[DONE]') return;
           try {
-            event = JSON.parse(data);
+            yield JSON.parse(data);
           } catch {
-            continue;
-          }
-
-          const content = event.choices?.[0]?.delta?.content;
-          if (content === undefined || content === null) {
-            // Forward non-content events as-is (e.g., role events)
-            res.write(`data: ${JSON.stringify(event)}\n\n`);
-            continue;
-          }
-
-          // Decrypt the content
-          try {
-            const decrypted = await instance.decryptStream
-              ? await decryptSingleChunk(session.privateKey, content)
-              : content;
-
-            // Re-emit as standard OpenAI SSE
-            const sseEvent = {
-              id: responseId,
-              object: 'chat.completion.chunk',
-              created: event.created || Math.floor(Date.now() / 1000),
-              model: session.modelId,
-              choices: [{
-                index: 0,
-                delta: { content: decrypted },
-                finish_reason: event.choices?.[0]?.finish_reason || null,
-              }],
-            };
-
-            res.write(`data: ${JSON.stringify(sseEvent)}\n\n`);
-            chunkIndex++;
-          } catch (e: unknown) {
-            const msg = e instanceof Error ? e.message : String(e);
-            if (msg.includes('session may be stale') || msg.includes('OperationError')) {
-              throw new Error('E2EE decryption failed — session may be stale. Clear the session and retry.');
-            }
-            // For non-critical decrypt failures (e.g., whitespace tokens that pass through)
-            logger.debug(`Chunk decrypt issue (non-fatal): ${msg}`);
+            // skip malformed events
           }
         }
       }
 
-      // Process remaining buffer
-      if (buffer.trim() && buffer.startsWith('data: ')) {
+      // Trailing event without a newline terminator
+      if (buffer.startsWith('data: ')) {
         const data = buffer.slice(6).trim();
-        if (data === '[DONE]') {
-          res.write('data: [DONE]\n\n');
+        if (data && data !== '[DONE]') {
+          try {
+            yield JSON.parse(data);
+          } catch {
+            // ignore partial JSON
+          }
         }
       }
     } finally {
       reader.releaseLock();
     }
+  }
 
+  /**
+   * Decrypt one hex field from a delta, mapping stale-session failures onto the
+   * retry path in handleE2EERequest.
+   */
+  private async decryptField(privateKey: Uint8Array, value: string): Promise<string | null> {
+    try {
+      return await decryptSingleChunk(privateKey, value);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes('session may be stale') || msg.includes('OperationError')) {
+        throw new Error('E2EE decryption failed — session may be stale. Clear the session and retry.');
+      }
+      logger.debug(`Chunk decrypt issue (non-fatal): ${msg}`);
+      return null;
+    }
+  }
+
+  /**
+   * Stream decrypted E2EE response as standard OpenAI SSE events.
+   *
+   * When tools were requested, assistant content is routed through a parser that
+   * splits `<tool_call>` blocks out of the prose and re-emits them as OpenAI
+   * `delta.tool_calls`, so clients see ordinary function calling.
+   */
+  private async streamE2EEResponse(
+    veniceRes: globalThis.Response,
+    session: { privateKey: Uint8Array; modelId: string },
+    res: Response,
+    parseTools: boolean
+  ): Promise<void> {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    const responseId = `chatcmpl-${Date.now().toString(36)}`;
+    const created = Math.floor(Date.now() / 1000);
+    const parser = parseTools ? new ToolCallStreamParser() : null;
+    let toolCallIndex = 0;
+    let finishReason: string | null = null;
+    let usage: unknown = null;
+
+    const emit = (delta: Record<string, unknown>, reason: string | null = null): void => {
+      res.write(`data: ${JSON.stringify({
+        id: responseId,
+        object: 'chat.completion.chunk',
+        created,
+        model: session.modelId,
+        choices: [{ index: 0, delta, finish_reason: reason }],
+      })}\n\n`);
+    };
+
+    const emitToolCalls = (calls: ToolCall[]): void => {
+      for (const call of calls) {
+        emit({ tool_calls: [{ index: toolCallIndex++, ...call }] });
+      }
+    };
+
+    for await (const event of this.iterateVeniceEvents(veniceRes)) {
+      if (event.usage) usage = event.usage;
+
+      const choice = event.choices?.[0];
+      if (!choice) continue;
+      if (choice.finish_reason) finishReason = choice.finish_reason;
+
+      const delta = choice.delta;
+      if (!delta) continue;
+
+      if (delta.role) emit({ role: delta.role });
+
+      // Reasoning arrives encrypted too — decrypt rather than forwarding hex.
+      if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
+        const reasoning = await this.decryptField(session.privateKey, delta.reasoning_content);
+        if (reasoning) emit({ reasoning_content: reasoning });
+      }
+
+      if (typeof delta.content === 'string' && delta.content) {
+        const text = await this.decryptField(session.privateKey, delta.content);
+        if (text === null) continue;
+
+        if (parser) {
+          const { content, toolCalls } = parser.push(text);
+          if (content) emit({ content });
+          emitToolCalls(toolCalls);
+        } else if (text) {
+          emit({ content: text });
+        }
+      }
+    }
+
+    if (parser) {
+      const { content, toolCalls } = parser.flush();
+      if (content) emit({ content });
+      emitToolCalls(toolCalls);
+      if (parser.sawToolCall) finishReason = 'tool_calls';
+    }
+
+    emit({}, finishReason || 'stop');
+
+    if (usage) {
+      res.write(`data: ${JSON.stringify({
+        id: responseId,
+        object: 'chat.completion.chunk',
+        created,
+        model: session.modelId,
+        choices: [],
+        usage,
+      })}\n\n`);
+    }
+
+    res.write('data: [DONE]\n\n');
     res.end();
   }
 
@@ -251,88 +334,66 @@ export class ProxyHandler {
   private async collectE2EEResponse(
     veniceRes: globalThis.Response,
     session: { privateKey: Uint8Array; modelId: string },
-    instance: { decryptStream: (body: ReadableStream<Uint8Array>, session: any) => AsyncGenerator<string> },
-    res: Response
+    res: Response,
+    parseTools: boolean
   ): Promise<void> {
-    const chunks: string[] = [];
+    const contentParts: string[] = [];
+    const reasoningParts: string[] = [];
     let finishReason: string | null = null;
     let created = Math.floor(Date.now() / 1000);
+    let usage: Record<string, unknown> | null = null;
 
-    // Parse SSE and collect decrypted text
-    const reader = veniceRes.body!.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
+    for await (const event of this.iterateVeniceEvents(veniceRes)) {
+      if (event.created) created = event.created;
+      if (event.usage) usage = event.usage;
 
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+      const choice = event.choices?.[0];
+      if (!choice) continue;
+      if (choice.finish_reason) finishReason = choice.finish_reason;
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop()!;
+      const delta = choice.delta;
+      if (!delta) continue;
 
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6).trim();
-          if (data === '[DONE]') continue;
-
-          let event: any;
-          try {
-            event = JSON.parse(data);
-          } catch {
-            continue;
-          }
-
-          if (event.created) created = event.created;
-
-          const content = event.choices?.[0]?.delta?.content;
-          if (content === undefined || content === null) continue;
-
-          if (event.choices?.[0]?.finish_reason) {
-            finishReason = event.choices[0].finish_reason;
-          }
-
-          try {
-            const decrypted = await decryptSingleChunk(session.privateKey, content);
-            chunks.push(decrypted);
-          } catch (e: unknown) {
-            const msg = e instanceof Error ? e.message : String(e);
-            if (msg.includes('OperationError')) {
-              throw new Error('E2EE decryption failed — session may be stale.');
-            }
-            logger.debug(`Chunk decrypt issue (non-fatal): ${msg}`);
-          }
-        }
+      if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
+        const reasoning = await this.decryptField(session.privateKey, delta.reasoning_content);
+        if (reasoning) reasoningParts.push(reasoning);
       }
-    } finally {
-      reader.releaseLock();
+
+      if (typeof delta.content === 'string' && delta.content) {
+        const text = await this.decryptField(session.privateKey, delta.content);
+        if (text) contentParts.push(text);
+      }
     }
 
-    const fullContent = chunks.join('');
+    const raw = contentParts.join('');
+    let content = raw;
+    let toolCalls: ToolCall[] = [];
 
-    // Build standard OpenAI response format
-    const response = {
+    if (parseTools) {
+      const parser = new ToolCallStreamParser();
+      const pushed = parser.push(raw);
+      const flushed = parser.flush();
+      content = pushed.content + flushed.content;
+      toolCalls = [...pushed.toolCalls, ...flushed.toolCalls];
+      if (toolCalls.length > 0) finishReason = 'tool_calls';
+    }
+
+    const message: Record<string, unknown> = {
+      role: 'assistant',
+      // OpenAI sends content: null when the turn is purely tool calls.
+      content: toolCalls.length > 0 && !content.trim() ? null : content,
+    };
+    if (reasoningParts.length > 0) message.reasoning_content = reasoningParts.join('');
+    if (toolCalls.length > 0) message.tool_calls = toolCalls;
+
+    res.json({
       id: `chatcmpl-${Date.now().toString(36)}`,
       object: 'chat.completion',
       created,
       model: session.modelId,
-      choices: [{
-        index: 0,
-        message: {
-          role: 'assistant',
-          content: fullContent,
-        },
-        finish_reason: finishReason || 'stop',
-      }],
-      usage: {
-        prompt_tokens: 0,  // Not available through E2EE
-        completion_tokens: 0,
-        total_tokens: 0,
-      },
-    };
-
-    res.json(response);
+      choices: [{ index: 0, message, finish_reason: finishReason || 'stop' }],
+      usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    });
   }
 
   /**

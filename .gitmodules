@@ -1,3 +1,4 @@
 [submodule "venice-e2ee"]
 	path = venice-e2ee
-	url = https://github.com/elkimek/venice-e2ee.git
+	url = https://github.com/jooray/venice-e2ee.git
+	branch = feat/function-calling
