@@ -774,6 +774,38 @@ describe('Config loading', () => {
     }
   });
 
+  it('ignores an api key set in the config file', async () => {
+    const { loadConfig } = await import('../src/config.js');
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'venice-cfg-'));
+    const cfgPath = path.join(dir, 'config.yaml');
+    fs.writeFileSync(cfgPath, 'port: 4242\nvenice_api_key: "key-from-file"\n');
+
+    const origKey = process.env.VENICE_API_KEY;
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    try {
+      // With the env var set, the file's key must not win.
+      process.env.VENICE_API_KEY = 'key-from-env';
+      const config = loadConfig(cfgPath);
+      expect(config.venice_api_key).toBe('key-from-env');
+      expect(config.port).toBe(4242); // other file values still load
+      expect(warn).toHaveBeenCalled();
+
+      // With no env var, a key in the file is not a substitute.
+      delete process.env.VENICE_API_KEY;
+      expect(() => loadConfig(cfgPath)).toThrow('VENICE_API_KEY');
+    } finally {
+      warn.mockRestore();
+      fs.rmSync(dir, { recursive: true, force: true });
+      if (origKey !== undefined) process.env.VENICE_API_KEY = origKey;
+      else delete process.env.VENICE_API_KEY;
+    }
+  });
+
   it('env vars override config defaults', async () => {
     const { loadConfig } = await import('../src/config.js');
 

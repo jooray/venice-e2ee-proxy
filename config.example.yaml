@@ -1,7 +1,12 @@
 # Venice E2EE Proxy Configuration
 #
 # Environment variables override values in this file.
-# VENICE_API_KEY should always be set via environment variable, not here.
+#
+# Do NOT put your API key here. VENICE_API_KEY is read from the environment only
+# (or from .env); a key found in this file is ignored with a warning. This file is
+# the one that gets shared, pasted into issues and committed by accident.
+#
+#   cp .env.example .env    # then set VENICE_API_KEY in .env
 
 # Server settings
 port: 3000
@@ -35,3 +40,40 @@ session_ttl: 1800000
 
 # Log level: debug, info, warn, error
 log_level: "info"
+
+# Models
+# ------
+# There is no model setting here — the model comes from each request, so any
+# Venice model works without configuration. Prefix a model with `e2ee-` to get
+# the encrypted path; anything else is forwarded to Venice untouched.
+#
+# Example request against the GLM model, which supports function calling:
+#
+#   curl http://127.0.0.1:3000/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "model": "e2ee-glm-5-2-p",
+#       "messages": [{"role": "user", "content": "What is the weather in Bratislava?"}],
+#       "tools": [{
+#         "type": "function",
+#         "function": {
+#           "name": "get_weather",
+#           "description": "Get the current weather in a given city",
+#           "parameters": {
+#             "type": "object",
+#             "properties": {"city": {"type": "string"}},
+#             "required": ["city"]
+#           }
+#         }
+#       }]
+#     }'
+#
+# Tool schemas and arguments are encrypted along with the conversation — see the
+# Function Calling section of the README.
+#
+# Not every E2EE model supports tools. Models that do, at the time of writing:
+#   e2ee-glm-5-2-p, e2ee-deepseek-v4-flash, e2ee-qwen3-30b-a3b-p,
+#   e2ee-qwen3-vl-30b-a3b-p, e2ee-qwen3-6-35b-a3b, e2ee-qwen3-6-27b
+# Check the current list for supportsFunctionCalling:
+#   curl -H "Authorization: Bearer $VENICE_API_KEY" \
+#     "https://api.venice.ai/api/v1/models?type=text"

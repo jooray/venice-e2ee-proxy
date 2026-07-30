@@ -59,8 +59,17 @@ export function loadConfig(configPath?: string): ProxyConfig {
   if (process.env.SESSION_TTL) envOverrides.session_ttl = parseInt(process.env.SESSION_TTL, 10);
   if (process.env.LOG_LEVEL) envOverrides.log_level = process.env.LOG_LEVEL;
 
-  // API key: always from environment
-  const apiKey = process.env.VENICE_API_KEY || (fileConfig.venice_api_key as string | undefined);
+  // API key: environment only, never the config file — config.yaml is the file
+  // people share, paste into issues and accidentally commit.
+  if (fileConfig.venice_api_key) {
+    delete fileConfig.venice_api_key;
+    console.warn(
+      'Ignoring venice_api_key found in the config file. Set VENICE_API_KEY in the ' +
+      'environment (or .env) instead, and remove the key from the config file.'
+    );
+  }
+
+  const apiKey = process.env.VENICE_API_KEY;
   if (!apiKey) {
     throw new Error(
       'VENICE_API_KEY environment variable is required.\n' +
