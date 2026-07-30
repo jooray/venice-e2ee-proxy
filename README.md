@@ -186,10 +186,25 @@ streaming, on the message when not).
 
 ### Function Calling
 
-Pass `tools` and `tool_choice` exactly as you would with the OpenAI API. Only models
-advertising `supportsFunctionCalling` can use them — `e2ee-glm-5-2-p`,
-`e2ee-deepseek-v4-flash`, `e2ee-qwen3-30b-a3b-p` and a few others; check
-`https://api.venice.ai/api/v1/models?type=text`.
+Pass `tools` and `tool_choice` exactly as you would with the OpenAI API.
+Verified to work over E2EE end-to-end against the live API:
+
+| Model | Context | Output | $ in / M | $ out / M |
+|---|---|---|---|---|
+| `e2ee-glm-5-2-p` | 524 288 | 32 768 | 1.75 | 5.75 |
+| `e2ee-deepseek-v4-flash` | 1 000 000 | 8 192 | 0.182 | 0.373 |
+| `e2ee-qwen3-6-27b` | 256 000 | 32 768 | 0.346 | 3.46 |
+| `e2ee-qwen3-6-35b-a3b` | 32 000 | 4 096 | 0.182 | 1.18 |
+| `e2ee-gemma-4-31b` | 32 000 | 4 096 | 0.139 | 0.43 |
+
+(`e2ee-qwen3-30b-a3b-p` advertises function calling too, but Venice's
+attestation endpoint currently returns 502 for it — unrelated to this proxy.)
+
+Function calling is implemented by carrying tool schemas in an encrypted
+system message and parsing the model's emitted `<tool_call>` blocks out of
+the decrypted stream, so tool names, descriptions, arguments and results
+stay ciphertext like the rest of the conversation. The test suite asserts
+that none of them reach the wire.
 
 ```bash
 curl http://127.0.0.1:3000/v1/chat/completions \
@@ -356,6 +371,76 @@ final = client.chat.completions.create(
 )
 print(final.choices[0].message.content)
 ```
+
+### opencode
+
+[opencode](https://opencode.ai) is an AI coding agent that supports any
+OpenAI-compatible backend. Add the proxy as a provider in
+`~/.config/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "venice-e2ee": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Venice E2EE Proxy",
+      "options": {
+        "baseURL": "http://127.0.0.1:5656/v1",
+        "apiKey": "unused"
+      },
+      "models": {
+        "e2ee-glm-5-2-p": {
+          "name": "GLM 5.2 (E2EE)",
+          "tool_call": true,
+          "reasoning": true,
+          "attachment": false,
+          "limit": { "context": 524288, "output": 32768 },
+          "cost": { "input": 1.75, "output": 5.75 }
+        },
+        "e2ee-deepseek-v4-flash": {
+          "name": "DeepSeek V4 Flash (E2EE)",
+          "tool_call": true,
+          "reasoning": true,
+          "attachment": false,
+          "limit": { "context": 1000000, "output": 8192 },
+          "cost": { "input": 0.182, "output": 0.373 }
+        },
+        "e2ee-qwen3-6-27b": {
+          "name": "Qwen 3.6 27B FP8 (E2EE)",
+          "tool_call": true,
+          "reasoning": true,
+          "attachment": false,
+          "limit": { "context": 256000, "output": 32768 },
+          "cost": { "input": 0.346, "output": 3.46 }
+        },
+        "e2ee-qwen3-6-35b-a3b": {
+          "name": "Qwen 3.6 35B A3B FP8 (E2EE)",
+          "tool_call": true,
+          "reasoning": true,
+          "attachment": false,
+          "limit": { "context": 32000, "output": 4096 },
+          "cost": { "input": 0.182, "output": 1.18 }
+        },
+        "e2ee-gemma-4-31b": {
+          "name": "Gemma 4 31B Instruct (E2EE)",
+          "tool_call": true,
+          "reasoning": true,
+          "attachment": false,
+          "limit": { "context": 32000, "output": 4096 },
+          "cost": { "input": 0.139, "output": 0.43 }
+        }
+      }
+    }
+  },
+  "model": "venice-e2ee/e2ee-glm-5-2-p",
+  "small_model": "venice-e2ee/e2ee-qwen3-6-35b-a3b"
+}
+```
+
+Adjust `baseURL` to match your `port` setting. The `apiKey` is unused — the
+proxy reads `VENICE_API_KEY` from the environment. A sample config is also
+in [`opencode.example.json`](opencode.example.json).
 
 ## Testing
 

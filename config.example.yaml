@@ -71,9 +71,13 @@ log_level: "info"
 # Tool schemas and arguments are encrypted along with the conversation — see the
 # Function Calling section of the README.
 #
-# Not every E2EE model supports tools. Models that do, at the time of writing:
-#   e2ee-glm-5-2-p, e2ee-deepseek-v4-flash, e2ee-qwen3-30b-a3b-p,
-#   e2ee-qwen3-vl-30b-a3b-p, e2ee-qwen3-6-35b-a3b, e2ee-qwen3-6-27b
-# Check the current list for supportsFunctionCalling:
+# Not every E2EE model supports tools. Verified working with function calling
+# over E2EE (July 2026):
+#   e2ee-glm-5-2-p        524K ctx  32K out  $1.75/$5.75 per M tokens
+#   e2ee-deepseek-v4-flash 1M ctx   8K out  $0.182/$0.373
+#   e2ee-qwen3-6-27b      256K ctx  32K out  $0.346/$3.46
+#   e2ee-qwen3-6-35b-a3b   32K ctx   4K out  $0.182/$1.18
+#   e2ee-gemma-4-31b       32K ctx   4K out  $0.139/$0.43
+# Check the current list:
 #   curl -H "Authorization: Bearer $VENICE_API_KEY" \
 #     "https://api.venice.ai/api/v1/models?type=text"
