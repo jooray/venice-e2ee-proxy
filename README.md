@@ -34,6 +34,7 @@ The proxy handles:
 - **AES-256-GCM encryption** of all messages
 - **Per-chunk decryption** of streaming responses (each chunk uses a fresh server ephemeral key)
 - **Function calling** over E2EE, with tool schemas and arguments kept encrypted ([details](#function-calling))
+- **TEE-only mode** via a `tee-` model prefix — attested enclave, plaintext prompts, Venice's native function calling ([details](#tee-only-models))
 - **Reasoning content** decryption for reasoning models (`reasoning_content`)
 - **Session caching** with configurable TTL (default 30 minutes)
 - **Parallel request handling** (sessions are safely shared across concurrent requests)
@@ -184,27 +185,112 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 Reasoning models additionally return decrypted `reasoning_content` (as a delta field when
 streaming, on the message when not).
 
+### TEE-Only Models
+
+Venice exposes one model ID for two request flows: the model runs inside an attested
+Intel TDX enclave either way, and [the request decides](https://docs.venice.ai/overview/privacy)
+whether prompts are also encrypted client-side. An OpenAI-compatible request carries
+nothing but a model name, so the proxy takes the choice from there — prefix the model
+with `tee-` and it runs TEE-only:
+
+```bash
+curl http://127.0.0.1:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "tee-e2ee-glm-5-2-p",
+    "messages": [{"role": "user", "content": "What is the weather in Bratislava?"}],
+    "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {
+      "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]
+    }}}]
+  }'
+```
+
+The proxy strips the prefix, verifies the enclave's attestation exactly as the E2EE path
+does, and forwards the request in plaintext with `venice_parameters.enable_e2ee: false`.
+Responses echo the prefixed ID back, so a client that replays `response.model` stays on
+the same path.
+
+**What you gain.** [Venice disables several features under E2EE](https://docs.venice.ai/guides/features/tee-e2ee-models)
+— streaming is mandatory, and web search, file uploads and **function calling** are off.
+TEE-only keeps them. Tool schemas go over the wire untouched and Venice returns native
+`tool_calls`, so none of the prompt-based tool machinery below is involved.
+
+**What you give up.** Venice's proxy sees your prompt. TEE-only removes the GPU host from
+your trust set; it does not remove Venice, whose no-retention guarantee is a policy rather
+than a cryptographic one. E2EE removes both. Pick `tee-` when you need the features, `e2ee-`
+when you need the secrecy.
+
+Attestation still gates the request: if verification fails, nothing is sent. With
+`verify_attestation: false` the prefix buys you nothing over a plain passthrough, and the
+proxy logs a warning saying so.
+
+> **Not yet covered: response signatures.** Attestation proves an enclave exists, not that
+> your particular response came from it. `GET /api/v1/tee/signature?model=…&request_id=…`
+> is meant to close that gap, and it works — it returns a signed `text` of
+> `<request-body-sha256>:<response-body-sha256>`, a 65-byte recoverable secp256k1
+> `signature`, a `signing_address`, and a `receipt` with an event log.
+>
+> Two things stop it short of real verification today. The signing scheme is undocumented:
+> 32 candidate combinations (keccak/sha256 over the text, the prefixed text, the raw hash
+> bytes and the receipt JSON, raw and EIP-191 wrapped, all four recovery bits) fail to
+> recover the reported `signing_address`. And the response hash cannot be reproduced from
+> the response body — Venice's own `verification.description` calls the hashes
+> "provider-reported values unless you can independently recompute them from a documented
+> canonical format".
+>
+> What *is* checkable without the scheme: `signing_address` equals the attestation's
+> `signing_address`, and `receipt.chat_id` equals the completion's `id`. That catches a
+> swapped key or a receipt for someone else's request, but it is a binding check, not a
+> signature check, so the proxy does not yet present it as verification.
+
 ### Function Calling
 
 Pass `tools` and `tool_choice` exactly as you would with the OpenAI API.
-Verified to work over E2EE end-to-end against the live API:
+Verified end-to-end against the live API, on both the E2EE and TEE-only paths:
 
-| Model | Context | Output | $ in / M | $ out / M |
-|---|---|---|---|---|
-| `e2ee-glm-5-2-p` | 524 288 | 32 768 | 1.75 | 5.75 |
-| `e2ee-deepseek-v4-flash` | 1 000 000 | 8 192 | 0.182 | 0.373 |
-| `e2ee-qwen3-6-27b` | 256 000 | 32 768 | 0.346 | 3.46 |
-| `e2ee-qwen3-6-35b-a3b` | 32 000 | 4 096 | 0.182 | 1.18 |
-| `e2ee-gemma-4-31b` | 32 000 | 4 096 | 0.139 | 0.43 |
+| Model | Tools | Context | Output | $ in / M | $ out / M |
+|---|---|---|---|---|---|
+| `e2ee-glm-5-2-p` | yes | 524 288 | 32 768 | 1.75 | 5.75 |
+| `e2ee-deepseek-v4-flash` | yes | 1 000 000 | 8 192 | 0.182 | 0.373 |
+| `e2ee-qwen3-6-27b` | yes | 256 000 | 32 768 | 0.346 | 3.46 |
+| `e2ee-qwen3-6-35b-a3b` | yes | 32 000 | 4 096 | 0.182 | 1.18 |
+| `e2ee-gemma-4-31b` | no | 32 000 | 4 096 | 0.139 | 0.43 |
 
-(`e2ee-qwen3-30b-a3b-p` advertises function calling too, but Venice's
-attestation endpoint currently returns 502 for it — unrelated to this proxy.)
+Check `supportsFunctionCalling` on `/models` before relying on tools. The two paths
+disagree about what happens when it is `false`, and the difference matters:
+
+- **TEE-only refuses.** `tools` is a real request parameter, so Venice rejects it —
+  `400 "tools is not supported by this model"`. You find out immediately.
+- **E2EE appears to work.** Schemas travel inside the prompt, so Venice's capability
+  check never sees them. `e2ee-gemma-4-31b` will emit well-formed `<tool_call>` blocks
+  that this proxy parses into real `tool_calls` — but the model was never trained for the
+  round trip and echoes the `<tool_response>` back instead of answering it.
+
+So the prompt-based path is not a way to add function calling to models that lack it. It
+is a way to keep function calling private on models that have it.
+
+(`e2ee-qwen3-30b-a3b-p` and `e2ee-qwen3-vl-30b-a3b-p` also advertise function calling, but
+Venice's attestation endpoint has been returning 502 for them — unrelated to this proxy.)
 
 Function calling is implemented by carrying tool schemas in an encrypted
 system message and parsing the model's emitted `<tool_call>` blocks out of
 the decrypted stream, so tool names, descriptions, arguments and results
 stay ciphertext like the rest of the conversation. The test suite asserts
 that none of them reach the wire.
+
+Because the model is following a prompt rather than a constrained decoder, the
+decoder accepts more than the format it asks for: `<function_call>` and
+`<|tool_call|>` tags as well as `<tool_call>`, several calls batched into one
+block as an array or a `{"tool_calls": [...]}` wrapper, `tool_name`/`args`
+spellings, an OpenAI-shaped `{"function": {...}}` payload, and a call emitted
+with no tags at all. The untagged form is only accepted when it names a tool you
+actually declared, so a model asked to reply in JSON still returns JSON. A single
+argument passed bare (`"arguments": "Bratislava"`) is wrapped using the schema
+when the function takes exactly one parameter.
+
+If you use this path directly through the library, pass the schemas to the parser
+— `new ToolCallStreamParser({ tools })` — since argument coercion and untagged
+recovery both need them. The proxy does this for you.
 
 ```bash
 curl http://127.0.0.1:3000/v1/chat/completions \

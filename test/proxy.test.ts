@@ -734,6 +734,229 @@ describe('E2EE with Venice error responses', () => {
   });
 });
 
+describe('TEE-only requests (tee- prefix)', () => {
+  let mockVenice: http.Server;
+  let proxyServer: http.Server;
+  let sessionManager: ReturnType<typeof createServer>['sessionManager'];
+  let attestedModels: string[];
+  let lastReceivedHeaders: http.IncomingHttpHeaders;
+  let lastReceivedBody: any;
+
+  const TOOLS = [{
+    type: 'function' as const,
+    function: {
+      name: 'get_weather',
+      description: 'Get the current weather in a given city',
+      parameters: {
+        type: 'object',
+        properties: { city: { type: 'string' } },
+        required: ['city'],
+      },
+    },
+  }];
+
+  beforeAll(async () => {
+    mockVenice = http.createServer((req, res) => {
+      if (req.method === 'GET' && req.url?.startsWith('/api/v1/tee/attestation')) {
+        const params = new URL(`http://localhost${req.url}`).searchParams;
+        attestedModels.push(params.get('model')!);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          verified: true,
+          nonce: params.get('nonce'),
+          model: params.get('model'),
+          signing_key: mockTeeKeypair.pubKeyHex,
+          server_verification: {
+            tdx: { valid: true },
+            signingAddressBinding: { bound: true },
+            nonceBinding: { bound: true },
+            verifiedAt: new Date().toISOString(),
+            verificationDurationMs: 100,
+          },
+        }));
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/api/v1/chat/completions') {
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', () => {
+          lastReceivedHeaders = req.headers;
+          lastReceivedBody = JSON.parse(body);
+
+          // Venice's native function calling: tools arrive as a normal request
+          // parameter and come back as native tool_calls.
+          const message = lastReceivedBody.tools
+            ? {
+                role: 'assistant',
+                content: null,
+                tool_calls: [{
+                  id: 'call_abc123',
+                  type: 'function',
+                  function: { name: 'get_weather', arguments: '{"city":"Bratislava"}' },
+                }],
+              }
+            : { role: 'assistant', content: 'Hello from the TEE' };
+
+          if (lastReceivedBody.stream) {
+            res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+            res.write(`data: ${JSON.stringify({
+              id: 'chatcmpl-tee',
+              object: 'chat.completion.chunk',
+              model: lastReceivedBody.model,
+              choices: [{ index: 0, delta: { content: 'Hello' }, finish_reason: null }],
+            })}\n\n`);
+            res.write(`data: ${JSON.stringify({
+              id: 'chatcmpl-tee',
+              object: 'chat.completion.chunk',
+              model: lastReceivedBody.model,
+              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+            })}\n\n`);
+            res.write('data: [DONE]\n\n');
+            res.end();
+          } else {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              id: 'chatcmpl-tee',
+              object: 'chat.completion',
+              model: lastReceivedBody.model,
+              choices: [{ index: 0, message, finish_reason: message.tool_calls ? 'tool_calls' : 'stop' }],
+            }));
+          }
+        });
+        return;
+      }
+
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise<void>(resolve => mockVenice.listen(0, '127.0.0.1', resolve));
+
+    const mockAddress = mockVenice.address() as { port: number };
+    const config = testConfig({
+      venice_base_url: `http://127.0.0.1:${mockAddress.port}`,
+      verify_attestation: false, // the mock cannot produce a real TDX quote
+    });
+    const result = createServer(config);
+    sessionManager = result.sessionManager;
+    proxyServer = result.app.listen(0, '127.0.0.1');
+    await new Promise<void>(resolve => proxyServer.once('listening', resolve));
+  });
+
+  beforeEach(() => {
+    attestedModels = [];
+    lastReceivedBody = undefined;
+    lastReceivedHeaders = {};
+  });
+
+  afterAll(async () => {
+    sessionManager.destroy();
+    await Promise.all([
+      new Promise<void>(resolve => proxyServer.close(() => resolve())),
+      new Promise<void>(resolve => mockVenice.close(() => resolve())),
+    ]);
+  });
+
+  it('strips the tee- prefix before forwarding to Venice', async () => {
+    const res = await request(proxyServer, 'POST', '/v1/chat/completions', {
+      model: 'tee-e2ee-glm-5-2-p',
+      messages: [{ role: 'user', content: 'Hello' }],
+      stream: false,
+    });
+    expect(res.status).toBe(200);
+    expect(lastReceivedBody.model).toBe('e2ee-glm-5-2-p');
+  });
+
+  it('attests the stripped model before the prompt leaves the proxy', async () => {
+    sessionManager.invalidateSession('e2ee-glm-5-2-p');
+    await request(proxyServer, 'POST', '/v1/chat/completions', {
+      model: 'tee-e2ee-glm-5-2-p',
+      messages: [{ role: 'user', content: 'Hello' }],
+      stream: false,
+    });
+    expect(attestedModels).toContain('e2ee-glm-5-2-p');
+  });
+
+  it('sends messages in plaintext with no E2EE headers', async () => {
+    await request(proxyServer, 'POST', '/v1/chat/completions', {
+      model: 'tee-e2ee-glm-5-2-p',
+      messages: [{ role: 'user', content: 'the secret is hunter2' }],
+      stream: false,
+    });
+    expect(lastReceivedBody.messages).toEqual([{ role: 'user', content: 'the secret is hunter2' }]);
+    expect(lastReceivedHeaders['x-venice-tee-client-pub-key']).toBeUndefined();
+    expect(lastReceivedHeaders['x-venice-tee-model-pub-key']).toBeUndefined();
+    expect(lastReceivedHeaders['x-venice-tee-signing-algo']).toBeUndefined();
+  });
+
+  it('pins enable_e2ee to false and keeps the caller venice_parameters', async () => {
+    await request(proxyServer, 'POST', '/v1/chat/completions', {
+      model: 'tee-e2ee-glm-5-2-p',
+      messages: [{ role: 'user', content: 'Hello' }],
+      venice_parameters: { include_venice_system_prompt: false },
+      stream: false,
+    });
+    expect(lastReceivedBody.venice_parameters).toEqual({
+      include_venice_system_prompt: false,
+      enable_e2ee: false,
+    });
+  });
+
+  it('forwards tools natively instead of rewriting them into a system prompt', async () => {
+    const res = await request(proxyServer, 'POST', '/v1/chat/completions', {
+      model: 'tee-e2ee-glm-5-2-p',
+      messages: [{ role: 'user', content: 'What is the weather in Bratislava?' }],
+      tools: TOOLS,
+      stream: false,
+    });
+
+    expect(lastReceivedBody.tools).toEqual(TOOLS);
+    // No injected schema prompt: the message list is untouched.
+    expect(lastReceivedBody.messages).toHaveLength(1);
+    expect(lastReceivedBody.messages[0].role).toBe('user');
+
+    const body = JSON.parse(res.body);
+    expect(body.choices[0].finish_reason).toBe('tool_calls');
+    expect(body.choices[0].message.tool_calls[0].function.name).toBe('get_weather');
+  });
+
+  it('echoes the prefixed model ID back to the client (non-streaming)', async () => {
+    const res = await request(proxyServer, 'POST', '/v1/chat/completions', {
+      model: 'tee-e2ee-glm-5-2-p',
+      messages: [{ role: 'user', content: 'Hello' }],
+      stream: false,
+    });
+    expect(JSON.parse(res.body).model).toBe('tee-e2ee-glm-5-2-p');
+  });
+
+  it('echoes the prefixed model ID back in every stream chunk', async () => {
+    const result = await streamRequest(proxyServer, '/v1/chat/completions', {
+      model: 'tee-e2ee-glm-5-2-p',
+      messages: [{ role: 'user', content: 'Hello' }],
+      stream: true,
+    });
+
+    expect(result.status).toBe(200);
+    expect(result.events).toContain('[DONE]');
+
+    const chunks = result.events.filter(e => e !== '[DONE]').map(e => JSON.parse(e));
+    expect(chunks.length).toBeGreaterThan(0);
+    for (const chunk of chunks) {
+      expect(chunk.model).toBe('tee-e2ee-glm-5-2-p');
+    }
+    expect(chunks.map(c => c.choices[0].delta.content || '').join('')).toBe('Hello');
+  });
+
+  it('rejects a bare tee- prefix with 400', async () => {
+    const res = await request(proxyServer, 'POST', '/v1/chat/completions', {
+      model: 'tee-',
+      messages: [{ role: 'user', content: 'Hello' }],
+    });
+    expect(res.status).toBe(400);
+    expect(JSON.parse(res.body).error.message).toContain('tee- prefix');
+  });
+});
+
 describe('Config loading', () => {
   it('loads config with defaults', async () => {
     const { loadConfig } = await import('../src/config.js');

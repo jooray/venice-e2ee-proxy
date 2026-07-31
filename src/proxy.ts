@@ -1,6 +1,6 @@
 import type { Request, Response } from 'express';
 import type { ProxyConfig } from './config.js';
-import { SessionManager } from './session-manager.js';
+import { SessionManager, stripTeePrefix } from './session-manager.js';
 import { logger } from './logger.js';
 import {
   buildToolSystemPrompt,
@@ -27,8 +27,10 @@ interface ChatCompletionRequest {
  * Core proxy handler for /v1/chat/completions.
  *
  * Routes:
+ * - TEE-only models (tee-*): verify attestation, forward plaintext with the
+ *   prefix stripped, leave function calling to Venice
  * - E2EE models (e2ee-*): encrypt messages, forward to Venice, decrypt response
- * - Non-E2EE models: transparently forward with Authorization header
+ * - Everything else: transparently forward with Authorization header
  */
 export class ProxyHandler {
   private sessionManager: SessionManager;
@@ -55,11 +57,155 @@ export class ProxyHandler {
       return;
     }
 
-    if (this.sessionManager.isE2EE(body.model)) {
+    if (this.sessionManager.isTeeOnly(body.model)) {
+      if (!stripTeePrefix(body.model)) {
+        res.status(400).json({
+          error: { message: 'model is required after the tee- prefix', type: 'invalid_request_error' },
+        });
+        return;
+      }
+      await this.handleTeeOnlyRequest(body, res);
+    } else if (this.sessionManager.isE2EE(body.model)) {
       await this.handleE2EERequest(body, res);
     } else {
       await this.handlePassthroughRequest(body, req, res);
     }
+  }
+
+  /**
+   * TEE-only path: verify the enclave, then forward the request in plaintext.
+   *
+   * Venice runs the model inside an attested Intel TDX enclave either way; the
+   * difference from the E2EE path is who else can read the prompt. Here Venice's
+   * proxy can, which is the price of keeping the features E2EE turns off —
+   * function calling among them. So no `tools` rewriting happens on this path:
+   * schemas go over the wire as-is and Venice returns native `tool_calls`.
+   *
+   * Attestation still runs, and still fails the request if it does not check out.
+   */
+  private async handleTeeOnlyRequest(
+    body: ChatCompletionRequest,
+    res: Response,
+    retried = false
+  ): Promise<void> {
+    const clientModel = body.model;
+    const upstreamModel = stripTeePrefix(clientModel);
+
+    try {
+      const { verified } = await this.sessionManager.getAttestation(upstreamModel);
+      logger.info(`TEE-only ${upstreamModel} | attestation: ${verified ? 'verified' : 'skipped'}`);
+      if (!verified) {
+        logger.warn(
+          `Attestation verification is disabled, so ${clientModel} gives you nothing over a plain ` +
+          `passthrough request. Set verify_attestation: true to make the tee- prefix mean something.`
+        );
+      }
+
+      const veniceBody: Record<string, unknown> = {
+        ...body,
+        model: upstreamModel,
+        venice_parameters: {
+          ...(body.venice_parameters || {}),
+          // Pin the mode rather than inferring it from the absence of E2EE
+          // headers, so a stray header can never silently switch encryption on
+          // and take function calling down with it.
+          enable_e2ee: false,
+        },
+      };
+
+      const veniceUrl = `${this.config.venice_base_url}/api/v1/chat/completions`;
+      logger.debug(`Forwarding plaintext TEE request to ${veniceUrl}`);
+
+      const veniceRes = await fetch(veniceUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.config.venice_api_key}`,
+        },
+        body: JSON.stringify(veniceBody),
+      });
+
+      res.status(veniceRes.status);
+      const contentType = veniceRes.headers.get('content-type');
+      if (contentType) res.setHeader('Content-Type', contentType);
+
+      if (!veniceRes.ok || !veniceRes.body) {
+        const errorText = await veniceRes.text();
+        if (!veniceRes.ok) logger.error(`Venice API error (${veniceRes.status}): ${errorText}`);
+        res.send(errorText);
+        return;
+      }
+
+      // Responses name the upstream model. Echo back the prefixed ID the client
+      // asked for instead: agent frameworks that feed `response.model` into the
+      // next request would otherwise drop to the E2EE path on turn two and lose
+      // their tools.
+      if (body.stream === true) {
+        await this.streamTeeOnlyResponse(veniceRes, res, upstreamModel, clientModel);
+      } else {
+        const text = await veniceRes.text();
+        res.send(rewriteModelField(text, upstreamModel, clientModel));
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+
+      if (!retried && (message.includes('attestation') || message.includes('TEE'))) {
+        logger.warn(`Attestation failed for ${upstreamModel}, retrying: ${message}`);
+        this.sessionManager.invalidateSession(upstreamModel);
+        await this.handleTeeOnlyRequest(body, res, true);
+        return;
+      }
+
+      logger.error(`TEE-only request failed: ${message}`);
+      if (!res.headersSent) {
+        res.status(502).json({ error: { message: `TEE proxy error: ${message}`, type: 'proxy_error' } });
+      }
+    }
+  }
+
+  /**
+   * Pipe Venice's SSE stream through, rewriting the model field per event.
+   *
+   * Line-oriented rather than event-oriented: anything that is not a `data:`
+   * line carrying JSON is forwarded byte for byte, so unfamiliar SSE fields
+   * survive the trip.
+   */
+  private async streamTeeOnlyResponse(
+    veniceRes: globalThis.Response,
+    res: Response,
+    from: string,
+    to: string
+  ): Promise<void> {
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    const reader = veniceRes.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        // Last element is an unterminated line; hold it until more bytes arrive.
+        buffer = lines.pop()!;
+
+        for (const line of lines) {
+          res.write(`${rewriteSseLine(line, from, to)}\n`);
+        }
+      }
+
+      if (buffer) res.write(rewriteSseLine(buffer, from, to));
+    } finally {
+      reader.releaseLock();
+    }
+
+    res.end();
   }
 
   /**
@@ -138,11 +284,14 @@ export class ProxyHandler {
         return;
       }
 
-      // 5. Decrypt and forward response
+      // 5. Decrypt and forward response. The parser gets the schemas too: they
+      // let it coerce arguments and recognise a call the model emitted without
+      // the surrounding tags.
+      const parserTools = toolPrompt ? tools ?? null : null;
       if (wantStream) {
-        await this.streamE2EEResponse(veniceRes, session, res, !!toolPrompt);
+        await this.streamE2EEResponse(veniceRes, session, res, parserTools);
       } else {
-        await this.collectE2EEResponse(veniceRes, session, res, !!toolPrompt);
+        await this.collectE2EEResponse(veniceRes, session, res, parserTools);
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
@@ -241,7 +390,7 @@ export class ProxyHandler {
     veniceRes: globalThis.Response,
     session: { privateKey: Uint8Array; modelId: string },
     res: Response,
-    parseTools: boolean
+    parseTools: ToolDefinition[] | null
   ): Promise<void> {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -251,7 +400,7 @@ export class ProxyHandler {
 
     const responseId = `chatcmpl-${Date.now().toString(36)}`;
     const created = Math.floor(Date.now() / 1000);
-    const parser = parseTools ? new ToolCallStreamParser() : null;
+    const parser = parseTools ? new ToolCallStreamParser({ tools: parseTools }) : null;
     let toolCallIndex = 0;
     let finishReason: string | null = null;
     let usage: unknown = null;
@@ -335,7 +484,7 @@ export class ProxyHandler {
     veniceRes: globalThis.Response,
     session: { privateKey: Uint8Array; modelId: string },
     res: Response,
-    parseTools: boolean
+    parseTools: ToolDefinition[] | null
   ): Promise<void> {
     const contentParts: string[] = [];
     const reasoningParts: string[] = [];
@@ -370,7 +519,7 @@ export class ProxyHandler {
     let toolCalls: ToolCall[] = [];
 
     if (parseTools) {
-      const parser = new ToolCallStreamParser();
+      const parser = new ToolCallStreamParser({ tools: parseTools });
       const pushed = parser.push(raw);
       const flushed = parser.flush();
       content = pushed.content + flushed.content;
@@ -461,6 +610,31 @@ export class ProxyHandler {
       res.status(502).json({ error: { message: `Proxy error: ${message}`, type: 'proxy_error' } });
     }
   }
+}
+
+/**
+ * Swap a JSON payload's top-level `model` field, leaving anything else — including
+ * payloads that are not JSON, or name a different model — exactly as it arrived.
+ */
+function rewriteModelField(payload: string, from: string, to: string): string {
+  try {
+    const parsed = JSON.parse(payload);
+    if (parsed && typeof parsed === 'object' && (parsed as { model?: unknown }).model === from) {
+      (parsed as { model: string }).model = to;
+      return JSON.stringify(parsed);
+    }
+  } catch {
+    // Not JSON — forward untouched.
+  }
+  return payload;
+}
+
+/** Apply {@link rewriteModelField} to one SSE line, passing through `[DONE]` and non-data lines. */
+function rewriteSseLine(line: string, from: string, to: string): string {
+  if (!line.startsWith('data: ')) return line;
+  const data = line.slice(6);
+  if (data.trim() === '[DONE]') return line;
+  return `data: ${rewriteModelField(data, from, to)}`;
 }
 
 /**
