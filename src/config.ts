@@ -9,6 +9,7 @@ export interface ProxyConfig {
   venice_base_url: string;
   verify_attestation: boolean;
   enable_dcap: boolean;
+  verify_receipts: boolean;
   session_ttl: number;
   log_level: 'debug' | 'info' | 'warn' | 'error';
 }
@@ -19,6 +20,7 @@ const DEFAULTS: Omit<ProxyConfig, 'venice_api_key'> = {
   venice_base_url: 'https://api.venice.ai',
   verify_attestation: true,
   enable_dcap: true,
+  verify_receipts: false,
   session_ttl: 30 * 60 * 1000, // 30 minutes
   log_level: 'info',
 };
@@ -55,6 +57,10 @@ export function loadConfig(configPath?: string): ProxyConfig {
   }
   if (process.env.ENABLE_DCAP !== undefined) {
     envOverrides.enable_dcap = process.env.ENABLE_DCAP === 'true' || process.env.ENABLE_DCAP === '1';
+  }
+  if (process.env.VERIFY_RECEIPTS !== undefined) {
+    envOverrides.verify_receipts =
+      process.env.VERIFY_RECEIPTS === 'true' || process.env.VERIFY_RECEIPTS === '1';
   }
   if (process.env.SESSION_TTL) envOverrides.session_ttl = parseInt(process.env.SESSION_TTL, 10);
   if (process.env.LOG_LEVEL) envOverrides.log_level = process.env.LOG_LEVEL;

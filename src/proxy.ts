@@ -142,10 +142,14 @@ export class ProxyHandler {
       // next request would otherwise drop to the E2EE path on turn two and lose
       // their tools.
       if (body.stream === true) {
-        await this.streamTeeOnlyResponse(veniceRes, res, upstreamModel, clientModel);
+        const upstreamId = await this.streamTeeOnlyResponse(
+          veniceRes, res, upstreamModel, clientModel
+        );
+        this.verifyReceiptInBackground(upstreamModel, upstreamId);
       } else {
         const text = await veniceRes.text();
         res.send(rewriteModelField(text, upstreamModel, clientModel));
+        this.verifyReceiptInBackground(upstreamModel, completionId(text));
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
@@ -165,6 +169,37 @@ export class ProxyHandler {
   }
 
   /**
+   * Fetch and verify the receipt for a completion, after the fact.
+   *
+   * Deliberately not awaited by the request path: the receipt is audit evidence,
+   * and blocking every completion on two extra round trips to prove what already
+   * happened is a bad trade. Failures are logged, never surfaced to the client.
+   */
+  private verifyReceiptInBackground(upstreamModel: string, requestId: string | null): void {
+    if (!this.config.verify_receipts || !requestId) return;
+
+    this.sessionManager
+      .verifyReceipt(upstreamModel, requestId)
+      .then((result) => {
+        const failed = result.checks.filter((check) => !check.ok);
+        if (result.verified) {
+          logger.info(`Receipt verified for ${requestId} (${upstreamModel})`);
+        } else {
+          logger.warn(
+            `Receipt NOT verified for ${requestId} (${upstreamModel}): ` +
+            failed.map((c) => `${c.name}${c.detail ? ` — ${c.detail}` : ''}`).join('; ')
+          );
+        }
+        debugDump('receipt', { model: upstreamModel, request_id: requestId, ...result });
+      })
+      .catch((err: unknown) => {
+        logger.warn(
+          `Receipt check failed for ${requestId}: ${err instanceof Error ? err.message : String(err)}`
+        );
+      });
+  }
+
+  /**
    * Pipe Venice's SSE stream through, rewriting the model field per event.
    *
    * Line-oriented rather than event-oriented: anything that is not a `data:`
@@ -176,7 +211,7 @@ export class ProxyHandler {
     res: Response,
     from: string,
     to: string
-  ): Promise<void> {
+  ): Promise<string | null> {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
@@ -185,6 +220,12 @@ export class ProxyHandler {
     const reader = veniceRes.body!.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let upstreamId: string | null = null;
+
+    const forward = (line: string): void => {
+      if (!upstreamId) upstreamId = completionId(line.startsWith('data: ') ? line.slice(6) : line);
+      res.write(`${rewriteSseLine(line, from, to)}\n`);
+    };
 
     try {
       while (true) {
@@ -196,9 +237,7 @@ export class ProxyHandler {
         // Last element is an unterminated line; hold it until more bytes arrive.
         buffer = lines.pop()!;
 
-        for (const line of lines) {
-          res.write(`${rewriteSseLine(line, from, to)}\n`);
-        }
+        for (const line of lines) forward(line);
       }
 
       if (buffer) res.write(rewriteSseLine(buffer, from, to));
@@ -207,6 +246,7 @@ export class ProxyHandler {
     }
 
     res.end();
+    return upstreamId;
   }
 
   /**
@@ -416,6 +456,9 @@ export class ProxyHandler {
     // Raw decrypted assistant text, captured before the tool parser touches it.
     const rawParts: string[] = [];
     const rawReasoning: string[] = [];
+    // Venice's own completion id, which is what the receipt endpoint keys on —
+    // the id we emit downstream is generated here and means nothing upstream.
+    let upstreamId: string | null = null;
 
     const emit = (delta: Record<string, unknown>, reason: string | null = null): void => {
       res.write(`data: ${JSON.stringify({
@@ -435,6 +478,7 @@ export class ProxyHandler {
 
     for await (const event of this.iterateVeniceEvents(veniceRes)) {
       if (event.usage) usage = event.usage;
+      if (!upstreamId && typeof event.id === 'string') upstreamId = event.id;
 
       const choice = event.choices?.[0];
       if (!choice) continue;
@@ -501,6 +545,8 @@ export class ProxyHandler {
 
     res.write('data: [DONE]\n\n');
     res.end();
+
+    this.verifyReceiptInBackground(session.modelId, upstreamId);
   }
 
   /**
@@ -517,10 +563,12 @@ export class ProxyHandler {
     let finishReason: string | null = null;
     let created = Math.floor(Date.now() / 1000);
     let usage: Record<string, unknown> | null = null;
+    let upstreamId: string | null = null;
 
     for await (const event of this.iterateVeniceEvents(veniceRes)) {
       if (event.created) created = event.created;
       if (event.usage) usage = event.usage;
+      if (!upstreamId && typeof event.id === 'string') upstreamId = event.id;
 
       const choice = event.choices?.[0];
       if (!choice) continue;
@@ -552,6 +600,8 @@ export class ProxyHandler {
       toolCalls = [...pushed.toolCalls, ...flushed.toolCalls];
       if (toolCalls.length > 0) finishReason = 'tool_calls';
     }
+
+    this.verifyReceiptInBackground(session.modelId, upstreamId);
 
     debugDump('response', {
       model: session.modelId,
@@ -663,6 +713,17 @@ function rewriteModelField(payload: string, from: string, to: string): string {
     // Not JSON — forward untouched.
   }
   return payload;
+}
+
+/** Venice's own completion id from a JSON payload, or null if there isn't one. */
+function completionId(payload: string): string | null {
+  try {
+    const parsed = JSON.parse(payload);
+    const id = (parsed as { id?: unknown })?.id;
+    return typeof id === 'string' && id ? id : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Apply {@link rewriteModelField} to one SSE line, passing through `[DONE]` and non-data lines. */

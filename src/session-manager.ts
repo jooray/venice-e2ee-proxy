@@ -1,5 +1,5 @@
-import { createVeniceE2EE, isE2EEModel } from 'venice-e2ee';
-import type { E2EESession, VeniceE2EEOptions } from 'venice-e2ee';
+import { createVeniceE2EE, isE2EEModel, verifyReceipt } from 'venice-e2ee';
+import type { E2EESession, VeniceE2EEOptions, ReceiptVerification } from 'venice-e2ee';
 import type { ProxyConfig } from './config.js';
 import { logger } from './logger.js';
 
@@ -142,6 +142,23 @@ export class SessionManager {
   async getAttestation(modelId: string): Promise<{ verified: boolean }> {
     const { session } = await this.getSession(modelId);
     return { verified: session.attestation !== undefined };
+  }
+
+  /**
+   * Fetch and verify the signed receipt for a completion.
+   *
+   * Attestation proves an enclave exists; the receipt proves this particular
+   * completion came out of it. Costs one attestation fetch and one signature
+   * fetch, which is why callers run it after the response is already on its way
+   * rather than in the request path.
+   */
+  async verifyReceipt(modelId: string, requestId: string): Promise<ReceiptVerification> {
+    const instance = this.getOrCreateInstance(modelId);
+    const [attestation, signature] = await Promise.all([
+      instance.attest(modelId),
+      instance.fetchResponseSignature(modelId, requestId),
+    ]);
+    return verifyReceipt(signature, attestation, { requestId });
   }
 
   /**

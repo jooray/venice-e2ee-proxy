@@ -33,6 +33,12 @@ verify_attestation: true
 # Requires @phala/dcap-qvl package: npm install @phala/dcap-qvl
 enable_dcap: true
 
+# Verify the signed receipt for each completion (default false).
+# Attestation proves an enclave exists; the receipt proves your particular
+# completion came out of it. Costs two extra round trips per request, run after
+# the response is already sent, so results are logged rather than returned.
+verify_receipts: false
+
 # Session TTL in milliseconds (default: 30 minutes)
 # E2EE sessions are cached per model. After TTL expires, a new session
 # is created with fresh key exchange and attestation verification.

@@ -114,6 +114,7 @@ cp .env.example .env
 | `HOST` | `127.0.0.1` | Host to bind to |
 | `VENICE_BASE_URL` | `https://api.venice.ai` | Venice API base URL |
 | `VERIFY_ATTESTATION` | `true` | Verify TEE attestation (recommended) |
+| `VERIFY_RECEIPTS` | `false` | Verify the signed receipt for each completion ([details](#response-receipts)) |
 | `ENABLE_DCAP` | `true` | Full DCAP quote verification |
 | `SESSION_TTL` | `1800000` | Session TTL in ms (default: 30 min) |
 | `LOG_LEVEL` | `info` | Log level: debug, info, warn, error |
@@ -224,24 +225,104 @@ Attestation still gates the request: if verification fails, nothing is sent. Wit
 `verify_attestation: false` the prefix buys you nothing over a plain passthrough, and the
 proxy logs a warning saying so.
 
-> **Not yet covered: response signatures.** Attestation proves an enclave exists, not that
-> your particular response came from it. `GET /api/v1/tee/signature?model=…&request_id=…`
-> is meant to close that gap, and it works — it returns a signed `text` of
-> `<request-body-sha256>:<response-body-sha256>`, a 65-byte recoverable secp256k1
-> `signature`, a `signing_address`, and a `receipt` with an event log.
->
-> Two things stop it short of real verification today. The signing scheme is undocumented:
-> 32 candidate combinations (keccak/sha256 over the text, the prefixed text, the raw hash
-> bytes and the receipt JSON, raw and EIP-191 wrapped, all four recovery bits) fail to
-> recover the reported `signing_address`. And the response hash cannot be reproduced from
-> the response body — Venice's own `verification.description` calls the hashes
-> "provider-reported values unless you can independently recompute them from a documented
-> canonical format".
->
-> What *is* checkable without the scheme: `signing_address` equals the attestation's
-> `signing_address`, and `receipt.chat_id` equals the completion's `id`. That catches a
-> swapped key or a receipt for someone else's request, but it is a binding check, not a
-> signature check, so the proxy does not yet present it as verification.
+### Response Receipts
+
+Attestation proves an enclave exists. It says nothing about whether *your* request
+went through it — Venice could serve you from an ordinary GPU and the attestation
+would still check out. The receipt closes that gap.
+
+Set `verify_receipts: true` (or `VERIFY_RECEIPTS=1`) and the proxy fetches
+`GET /api/v1/tee/signature` after each completion and verifies it, on both the
+E2EE and TEE-only paths:
+
+```
+INFO  Receipt verified for 11955ea790bd48b89e7d037ecd1da988 (e2ee-glm-5-2-p)
+```
+
+Six checks run, all of which must pass:
+
+| Check | What it rules out |
+|---|---|
+| `key_in_attested_keyset` | a receipt signed by a key the enclave never vouched for |
+| `key_algo_matches` | algorithm confusion between receipt and keyset |
+| `receipt_signature` | any edit to the receipt or its event log |
+| `keyset_digest_matches` | a substituted keyset — the digest is folded into the quote's `report_data` |
+| `chat_id_matches_request` | a valid receipt for somebody else's completion |
+| `signing_address_matches_attestation` | the two endpoints describing different enclaves |
+
+The signature is Ed25519 over the RFC 8785 (JCS) canonicalization of the receipt
+with `signature.value` removed, under a key from
+`attestation.workload_keyset.receipt_signing_keys` — the scheme Phala's
+[private-ai-gateway](https://github.com/Dstack-TEE/private-ai-gateway) reference
+verifier implements. Note that the top-level secp256k1 `signature` over
+`<request-hash>:<response-hash>` in the same response is *not* what gets checked;
+its message construction is undocumented and the reference verifier ignores it.
+
+Verification runs after the response is already on its way to the client. It
+costs two extra round trips, and blocking every completion to prove what already
+happened is a bad trade — so results are logged, not returned. Off by default.
+
+#### What the receipt does not tell you
+
+- **The response bytes are not bound to it.** `response.returned.cleartext_hash`
+  covers the gateway's output; Venice re-wraps that (adding `cost`,
+  `venice_parameters`) before you see it, so `sha256(body you received)` will not
+  match. The receipt proves the enclave produced *a* response with that hash, not
+  that the JSON in your hand is that response.
+- **The attested enclave is the gateway, not the GPU.** See below.
+
+### What is actually attested
+
+The attestation is worth reading rather than trusting, and it is self-describing.
+`attestation.evidence.app_compose` carries the full measured deployment manifest,
+hashed into RTMR3 in the TDX quote. For Venice's E2EE models it resolves to
+Phala's `private-ai-gateway` running under dstack, fronting `tee.redpill.ai`,
+`api.redpill.ai` and `inference.phala.com`.
+
+What that buys you, and what it does not:
+
+- **`vm_config.num_gpus` is `0`.** The attested CVM has no GPU. It is the
+  *gateway*; inference happens on a separate host (`*.usc2-router.phala.com`)
+  reached over TLS. Your prompt is decrypted inside the attested gateway enclave
+  and forwarded onward — a real boundary, but not "decrypted only on the machine
+  that runs the model".
+- **The upstream is vouched for, not verified by you.** The receipt's
+  `upstream.verified.claims.tee_attested` reads
+  `{"status": "asserted", "source": "verifier_derived"}` — the gateway says it
+  checked. `gpu_attested`, `tcb_up_to_date`, `os_known_good` and
+  `model_weights_provenance` are all `"unknown"`, and `upstream.verified.required`
+  is `false`.
+- **The gateway is built from source at boot, not from a pinned image.**
+  `source_provenance` names
+  `https://github.com/Dstack-TEE/private-ai-gateway.git` at a specific commit, and
+  those literals sit in the compose `environment:` block, so the commit is
+  measured into the quote. But `source_provenance.image_digest` and
+  `image_provenance` are both `null`: what is attested is the *instruction* to
+  build that commit, not a reproducible artifact. The build fetches dependencies
+  at boot and reuses a persistent, unmeasured `pal-cache` volume across reboots.
+- **Not every image is pinned.** `dstack-ingress`, the launcher and
+  `node-exporter` are pinned by `@sha256:` digest. `dstacktee/dstack-verifier`
+  is `:latest` — its content can change without changing any measurement. It
+  serves the NEAR AI verification path rather than the ACI path Venice's models
+  use, so it is likely out of the request path, but the measurement does not
+  constrain it.
+- **The OS image is a dev build.** `vm_config.image` is
+  `dstack-dev-0.5.9-de9c74f0`, and `attestation.vendor` is
+  `private-ai-gateway-dev`.
+- **Attested serving is not forced on Venice's hostname.** The measured gateway
+  config sets `middleware.tee_only_domains` to `["tee.redpill.ai",
+  "inference.phala.com"]`; on those hosts completions are, per the gateway source,
+  "forced to attested serving". The attestation's
+  `evidence.downstream_tls_binding.domain` for Venice is `api.redpill.ai`, which
+  is **not** in that list — consistent with `upstream.verified.required: false`.
+  Observed requests were still routed to a verified upstream; the point is that
+  the policy does not compel it.
+
+None of this is hidden — it is all in the attestation Venice already serves, and
+the ACI spec is explicit that measurement binding "does not prove that an image,
+launcher, source revision, compiler, dependency, or OS build is acceptable".
+Decide what that is worth for your threat model rather than reading "TEE" as a
+single boolean.
 
 ### Function Calling
 
