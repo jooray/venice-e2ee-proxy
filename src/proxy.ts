@@ -2,6 +2,7 @@ import type { Request, Response } from 'express';
 import type { ProxyConfig } from './config.js';
 import { SessionManager, stripTeePrefix } from './session-manager.js';
 import { logger } from './logger.js';
+import { debugDump } from './debug-dump.js';
 import {
   buildToolSystemPrompt,
   renderToolMessages,
@@ -245,6 +246,14 @@ export class ProxyHandler {
         logger.debug(`Injected ${tools!.length} tool schema(s) into the encrypted prompt`);
       }
 
+      debugDump('request', {
+        model: modelId,
+        stream: wantStream,
+        tool_choice: tool_choice ?? null,
+        tools: tools ?? null,
+        messages,
+      });
+
       // 3. Encrypt every message (the TEE rejects any plaintext content)
       const { encryptedMessages, headers: e2eeHeaders, veniceParameters } = await instance.encrypt(messages, session);
 
@@ -404,6 +413,9 @@ export class ProxyHandler {
     let toolCallIndex = 0;
     let finishReason: string | null = null;
     let usage: unknown = null;
+    // Raw decrypted assistant text, captured before the tool parser touches it.
+    const rawParts: string[] = [];
+    const rawReasoning: string[] = [];
 
     const emit = (delta: Record<string, unknown>, reason: string | null = null): void => {
       res.write(`data: ${JSON.stringify({
@@ -436,12 +448,16 @@ export class ProxyHandler {
       // Reasoning arrives encrypted too — decrypt rather than forwarding hex.
       if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
         const reasoning = await this.decryptField(session.privateKey, delta.reasoning_content);
-        if (reasoning) emit({ reasoning_content: reasoning });
+        if (reasoning) {
+          rawReasoning.push(reasoning);
+          emit({ reasoning_content: reasoning });
+        }
       }
 
       if (typeof delta.content === 'string' && delta.content) {
         const text = await this.decryptField(session.privateKey, delta.content);
         if (text === null) continue;
+        rawParts.push(text);
 
         if (parser) {
           const { content, toolCalls } = parser.push(text);
@@ -459,6 +475,16 @@ export class ProxyHandler {
       emitToolCalls(toolCalls);
       if (parser.sawToolCall) finishReason = 'tool_calls';
     }
+
+    debugDump('response', {
+      model: session.modelId,
+      stream: true,
+      raw: rawParts.join(''),
+      reasoning: rawReasoning.join(''),
+      chunk_count: rawParts.length,
+      parsed_tool_calls: parser?.toolCalls ?? [],
+      finish_reason: finishReason,
+    });
 
     emit({}, finishReason || 'stop');
 
@@ -526,6 +552,16 @@ export class ProxyHandler {
       toolCalls = [...pushed.toolCalls, ...flushed.toolCalls];
       if (toolCalls.length > 0) finishReason = 'tool_calls';
     }
+
+    debugDump('response', {
+      model: session.modelId,
+      stream: false,
+      raw,
+      reasoning: reasoningParts.join(''),
+      chunk_count: contentParts.length,
+      parsed_tool_calls: toolCalls,
+      finish_reason: finishReason,
+    });
 
     const message: Record<string, unknown> = {
       role: 'assistant',

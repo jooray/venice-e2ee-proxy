@@ -292,6 +292,48 @@ If you use this path directly through the library, pass the schemas to the parse
 — `new ToolCallStreamParser({ tools })` — since argument coercion and untagged
 recovery both need them. The proxy does this for you.
 
+#### What GLM actually emits
+
+GLM has its own tool-call template it was trained on, and it uses the same
+`<tool_call>` tag this prompt asks for. So it reaches for that tag and then fills
+it with a blend of its own format and the requested JSON — differently each time.
+Captured verbatim from `e2ee-glm-5-2-p` in one opencode session:
+
+```
+<tool_call>read</arg_value>filePath</arg_key><arg_value>/Users/juraj/…</arg_value></tool_call>
+<tool_call>glob<arg_key>pattern "**/opencode.json"</arg_value></tool_call>
+<tool_call>
+{"name":"edit","arguments":{"filePath":"…","oldString":"…"}}
+</tool_call>
+```
+
+All three parse. The decoder accepts the JSON body, well-formed
+`<arg_key>`/`<arg_value>` pairs, those pairs with tags missing or run together,
+and — gated on the declared schemas — a body with no tags at all. A block that
+still yields nothing is returned as visible content rather than dropped, so a
+format nobody has seen yet shows up as a mangled answer instead of an empty turn.
+
+In that session the degenerate form appeared on the first tool call and every
+later turn used clean JSON, which fits the rendered tool history acting as a
+worked example the first call does not have.
+
+### Debugging tool-call formats
+
+When a client's tool call does not come back the way you expect, set
+`VENICE_PROXY_DEBUG_DUMP` to a file path. The proxy appends one JSON object per
+request and per response: the tool schemas and fully-rendered prompt going in,
+and the raw decrypted model text going out — captured *before* the tool parser
+touches it — alongside reasoning, chunk count, and the parsed result.
+
+```bash
+VENICE_PROXY_DEBUG_DUMP=/tmp/venice-dump.jsonl npm run dev
+```
+
+> This writes your plaintext prompts and responses to disk, which is exactly what
+> the rest of this proxy exists to prevent. It is off unless the variable is set,
+> the proxy logs a warning the first time it writes, and the file is yours to
+> delete. Do not leave it enabled.
+
 ```bash
 curl http://127.0.0.1:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
