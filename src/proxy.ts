@@ -24,6 +24,21 @@ interface ChatCompletionRequest {
   [key: string]: unknown;
 }
 
+/**
+ * Whether a failed session is worth one more attempt.
+ *
+ * The retry exists for stale or half-built sessions, where a fresh handshake
+ * genuinely fixes things. GPU attestation failures are not that: a verdict of
+ * "debug mode" or a nonce mismatch repeats exactly, and when the failure is
+ * NVIDIA being unreachable, retrying doubles the traffic aimed at a service
+ * already in trouble. The word "attestation" appears in both kinds of message,
+ * so the GPU case has to be excluded deliberately.
+ */
+function isRetriableSessionFailure(message: string): boolean {
+  if (/GPU attestation|NVIDIA|NRAS/i.test(message)) return false;
+  return message.includes('attestation') || message.includes('TEE');
+}
+
 /** Models already warned about, so a long agent session says this once. */
 const warnedE2EEToolModels = new Set<string>();
 const reportedReceiptlessModels = new Set<string>();
@@ -166,7 +181,10 @@ export class ProxyHandler {
 
     try {
       const { verified } = await this.sessionManager.getAttestation(upstreamModel);
-      logger.info(`TEE-only ${upstreamModel} | attestation: ${verified ? 'verified' : 'skipped'}`);
+      logger.info(
+        `TEE-only ${upstreamModel} | attestation: ${verified ? 'verified' : 'skipped'}` +
+        (retried ? ' (succeeded on retry)' : '')
+      );
       if (!verified) {
         logger.warn(
           `Attestation verification is disabled, so ${clientModel} gives you nothing over a plain ` +
@@ -229,8 +247,8 @@ export class ProxyHandler {
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
 
-      if (!retried && (message.includes('attestation') || message.includes('TEE'))) {
-        logger.warn(`Attestation failed for ${upstreamModel}, retrying: ${message}`);
+      if (!retried && isRetriableSessionFailure(message)) {
+        logger.warn(`Attestation failed for ${upstreamModel}, retrying once: ${message}`);
         this.sessionManager.invalidateSession(upstreamModel);
         await this.handleTeeOnlyRequest(body, res, true);
         return;
@@ -396,7 +414,10 @@ export class ProxyHandler {
       // 1. Get or create E2EE session
       logger.debug(`Getting E2EE session for ${modelId}`);
       const { session, instance } = await this.sessionManager.getSession(modelId);
-      logger.info(`E2EE ${modelId} | attestation: ${session.attestation ? 'verified' : 'skipped'}`);
+      logger.info(
+        `E2EE ${modelId} | attestation: ${session.attestation ? 'verified' : 'skipped'}` +
+        (retried ? ' (succeeded on retry)' : '')
+      );
 
       // 2. Move function calling into the encrypted channel — see the warning in
       //    warnAboutE2EEToolCalling for how well that actually works.
@@ -494,8 +515,8 @@ export class ProxyHandler {
       }
 
       // Retry on attestation/session creation failures
-      if (!retried && (message.includes('attestation') || message.includes('TEE'))) {
-        logger.warn(`Session creation failed for ${modelId}, retrying: ${message}`);
+      if (!retried && isRetriableSessionFailure(message)) {
+        logger.warn(`Session creation failed for ${modelId}, retrying once: ${message}`);
         this.sessionManager.invalidateSession(modelId);
         await this.handleE2EERequest(body, res, true);
         return;

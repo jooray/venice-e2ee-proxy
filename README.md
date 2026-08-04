@@ -30,7 +30,8 @@ The proxy handles:
 
 - **ECDH key exchange** (secp256k1) with the TEE
 - **TEE attestation verification** (Intel TDX quote parsing, nonce binding, signing key binding)
-- **Optional full DCAP verification** (PCK certificate chain, quote signatures, TCB evaluation)
+- **Full DCAP verification** (PCK certificate chain to Intel's root, quote signatures, TCB evaluation)
+- **GPU attestation** against NVIDIA's root of trust, nonce-bound and failing closed ([details](#gpu-attestation))
 - **AES-256-GCM encryption** of all messages
 - **Per-chunk decryption** of streaming responses (each chunk uses a fresh server ephemeral key)
 - **Function calling** over E2EE, with tool schemas and arguments kept encrypted ([details](#function-calling))
@@ -118,7 +119,7 @@ cp .env.example .env
 | `RECEIPT_ANCHOR_STORE` | `.venice-receipt-anchors.json` | Where trust-on-first-use receipt anchors are recorded |
 | `ENABLE_DCAP` | `true` | Full DCAP quote verification |
 | `DCAP_PCCS_URL` | Phala PCCS | Where DCAP collateral is fetched from ([details](#dcap-collateral)) |
-| `VERIFY_GPU_ATTESTATION` | `false` | Check GPU evidence against NVIDIA, failing closed ([details](#gpu-attestation)) |
+| `VERIFY_GPU_ATTESTATION` | `true` | Check GPU evidence against NVIDIA, failing closed ([details](#gpu-attestation)) |
 | `VERIFY_GPU_TOKEN_SIGNATURES` | `true` | Verify NVIDIA's ES384 token signatures, not just TLS |
 | `GPU_PINNED_CERTS` | (none) | Comma-separated SHA-256 digests required in NVIDIA's cert chain |
 | `NRAS_URL` | NVIDIA NRAS | Override the GPU attestation verifier endpoint |
@@ -135,7 +136,7 @@ venice_base_url: "https://api.venice.ai"
 verify_attestation: true
 enable_dcap: true
 # dcap_pccs_url: "https://your-pccs.example/sgx/certification/v4"
-verify_gpu_attestation: false
+verify_gpu_attestation: true
 session_ttl: 1800000
 log_level: "info"
 ```
@@ -156,28 +157,119 @@ the check — it only changes who serves and observes it.
 
 ### Attestation Verification
 
-The proxy supports two levels of attestation verification:
+Three checks run, and they answer three different questions. All are on by
+default.
 
-**Level 1 (verify_attestation: true)** - Always recommended:
-- Parses the Intel TDX quote binary
-- Rejects debug-mode TEEs
-- Verifies your client nonce in REPORTDATA (prevents replay attacks)
-- Verifies the signing key's Ethereum address in REPORTDATA
-- Cross-checks Venice's server-side verification results
+| Setting | Question it answers | Trusts |
+|---|---|---|
+| `verify_attestation` | Is this quote about *my* request, and does it carry the key I am about to encrypt to? | nothing external |
+| `enable_dcap` | Is this a real Intel TDX quote from genuine, up-to-date silicon? | Intel's roots, via a PCCS |
+| `verify_gpu_attestation` | Does NVIDIA vouch for the GPU evidence served alongside it? | NVIDIA's roots, via NRAS |
 
-**Level 2 (enable_dcap: true)** - Full verification:
-- Everything in Level 1, plus:
-- PCK certificate chain validation up to Intel SGX Root CA
-- ECDSA P-256 quote signature verification
-- QE identity validation
-- TCB level evaluation and CRL checking
-- Requires `@phala/dcap-qvl` (included in this proxy's dependencies)
+They stack. Binding without DCAP means a well-formed quote nobody vouched for.
+DCAP without binding means a genuine quote that could be about somebody else's
+session. Neither says anything about the GPU, which is why the third exists.
 
-To disable all verification (not recommended):
+**`verify_attestation`** — parses the quote binary and checks, client-side:
+
+- your 32-byte nonce is in `REPORTDATA[32:64]`, so the quote is about this
+  request and not a replay
+- the signing key's Ethereum address is in `REPORTDATA[0:20]`, so the key you
+  encrypt to is the one the enclave attested
+- the TD debug bit is clear (a debug-mode TEE can be introspected by its host)
+- Venice's own `server_verification` agrees with what the proxy computed
+
+**`enable_dcap`** — hands the quote to `@phala/dcap-qvl`, which validates the PCK
+certificate chain to Intel's SGX Root CA, the ECDSA P-256 quote signature, the
+quoting enclave's identity, and the TCB level against Intel's collateral and
+CRLs. This is what makes the quote *evidence* rather than a well-formed blob.
+See [DCAP collateral](#dcap-collateral) for where that collateral comes from.
+
+**`verify_gpu_attestation`** — covered separately under
+[GPU attestation](#gpu-attestation).
+
+To turn verification off (not recommended — and it turns the GPU check off with
+it, since there is then no attestation to check GPU evidence against):
+
 ```yaml
 verify_attestation: false
 enable_dcap: false
 ```
+
+#### What the quote actually measures
+
+A passing attestation is not a single bit. The quote carries measurement
+registers describing what booted, and they can be recomputed rather than taken
+on trust:
+
+| Register | Holds | Can you reproduce it? |
+|---|---|---|
+| `MRTD` | the VM's initial memory — firmware and kernel | Only by rebuilding the dstack OS image |
+| `MRCONFIGID` | `0x01 ‖ sha256(app_compose) ‖ zeros` | **Yes** — hash the manifest the response ships |
+| `RTMR0-2` | firmware and boot configuration | No |
+| `RTMR3` | extended by a measured boot event log | Partly — individual events can be cross-checked |
+| `REPORTDATA` | `signing address(20) ‖ zeros(12) ‖ nonce(32)` | **Yes** — both halves are values you already hold |
+
+The reproducible ones matter most, because they are the ones binding the quote to
+things you can read. `MRCONFIGID` covers the deployment manifest, so the enclave
+cannot be running a different compose file than the one it showed you. The
+RTMR3 event log names `compose-hash`, `os-image-hash`, `app-id`, `key-provider`,
+`mr-kms` and `instance-id`, and the first two restate values carried elsewhere in
+the response — so they can be checked against each other.
+
+`scripts/audit-attestation.py` does all of this and prints what held:
+
+```
+$ ./scripts/audit-attestation.py --model e2ee-glm-5-2-p
+
+BINDING (recomputed from the quote's REPORTDATA)
+  PASS  our nonce is inside the quote
+  PASS  quote binds the signing key 0x79a5061efe5a46b0d1f33b11cf1c5adbedae6b79
+  PASS  TEE is not in debug mode
+
+WHAT IS RUNNING (recomputed, not taken from Venice's own report)
+  PASS  MRCONFIGID reproduces from the compose manifest
+  PASS  event log's compose-hash matches that manifest
+  PASS  event log's os-image-hash matches vm_config
+    --  RTMR3 is extended by 10 measured boot events
+```
+
+#### Can you verify the images it is running?
+
+Partly, and the gap is worth knowing precisely.
+
+The compose manifest is measured, so the *list* of images is fixed by the quote —
+Venice cannot claim one manifest and run another. Within that manifest, most
+images are pinned by digest, but not all, and the component that actually serves
+inference is not shipped as an image at all:
+
+```
+IMAGES NAMED BY THE MEASURED MANIFEST
+  PASS  dstacktee/dstack-ingress:2.2            pinned @ sha256:d05a7b34…
+  PASS  ghcr.io/redpill-ai/private-ai-launcher  pinned @ sha256:c083ff9e…
+  FAIL  dstacktee/dstack-verifier:latest        NOT pinned
+  PASS  prom/node-exporter:v1.8.2               pinned @ sha256:4032c6d5…
+
+BUILT AT BOOT, NOT SHIPPED AS AN IMAGE
+  repo         https://github.com/Dstack-TEE/private-ai-gateway.git
+  commit       aa65d64c191949b8df7b1ebe210f5b8f8a8e6b99
+  image digest null — the built artifact is not measured
+```
+
+So three of four images are pinned to exact content. `dstack-verifier` rides a
+`:latest` tag, which can point somewhere else tomorrow without changing any
+measurement. And the gateway itself — the thing your prompt is decrypted in — is
+cloned and built from source at boot by the launcher. What the quote fixes is the
+*instruction* to build a named commit, not the binary that instruction produced.
+There is no reproducible build to check it against, and `image_digest` is `null`.
+
+The honest summary: you can verify **what the enclave was told to run**, exactly
+and byte for byte. You cannot verify **what it ended up running**, because part
+of that is assembled at boot from sources fetched over the network.
+
+[What is actually attested](#what-is-actually-attested) goes further into what
+that means for the deployment as a whole, including why the attested VM reports
+no GPU.
 
 ## Usage
 
@@ -237,10 +329,15 @@ the same path.
 TEE-only keeps them. Tool schemas go over the wire untouched and Venice returns native
 `tool_calls`, so none of the prompt-based tool machinery below is involved.
 
-**What you give up.** Venice's proxy sees your prompt. TEE-only removes the GPU host from
-your trust set; it does not remove Venice, whose no-retention guarantee is a policy rather
-than a cryptographic one. E2EE removes both. Pick `tee-` when you need the features, `e2ee-`
-when you need the secrecy.
+**What you give up.** Venice's proxy sees your prompt in the clear. E2EE keeps it encrypted
+until it reaches the attested gateway enclave, so Venice's own infrastructure never holds
+the plaintext — a real difference, and the reason to prefer `e2ee-` when you need secrecy.
+
+Neither mode removes the GPU host from your trust set. The attested CVM reports
+`num_gpus: 0` and forwards inference to a separate machine over TLS, so on both paths your
+prompt is plaintext by the time it reaches the hardware running the model. What E2EE
+removes is Venice's proxy layer, not the inference host. See
+[What is actually attested](#what-is-actually-attested).
 
 Attestation still gates the request: if verification fails, nothing is sent. With
 `verify_attestation: false` the prefix buys you nothing over a plain passthrough, and the
@@ -314,10 +411,10 @@ INFO  Receipt authentic for ce0fd827… (e2ee-glm-5-2-p): signature, keyset and 
 ```
 
 So what a receipt buys you here is that **the attested enclave signed a receipt
-for this completion id** — 11 of 13 checks, including the Ed25519 receipt
-signature, the keyset membership and the anchor. What it does not buy is proof
-that the bytes you received are the ones it produced. Only something sitting
-directly in front of the ACI gateway could establish that.
+for this completion id** — 12 of the 14 checks below, including the Ed25519
+receipt signature, the keyset membership and the anchor. What it does not buy is
+proof that the bytes you received are the ones it produced. Only something
+sitting directly in front of the ACI gateway could establish that.
 
 #### Not every model issues receipts
 
@@ -331,27 +428,49 @@ INFO  Receipts unavailable for e2ee-deepseek-v4-flash: attestation carries no AC
       workload identity (pre-ACI gateway). Completions are unaffected.
 ```
 
-`e2ee-glm-5-2-p` and `e2ee-qwen3-30b-a3b-p` share one workload today, so they pin
-to the same anchor — recorded separately, so a move by either is still visible.
+Models can also share a workload, in which case they pin to the same anchor —
+recorded per model, so a move by either is still visible. `e2ee-glm-5-2-p` and
+`e2ee-qwen3-30b-a3b-p` did; as of August 2026 the latter's attestation endpoint
+returns 502, so that pairing cannot currently be re-checked.
 
 Set `verify_receipts: true` (or `VERIFY_RECEIPTS=1`) and the proxy fetches
 `GET /api/v1/tee/signature` after each completion and verifies it, on both the
 E2EE and TEE-only paths:
 
 ```
-INFO  Receipt verified for 11955ea790bd48b89e7d037ecd1da988 (e2ee-glm-5-2-p)
+INFO  Receipt authentic for 0b56cc7a57e14e69a7269ae25288a830 (e2ee-glm-5-2-p): signature,
+      keyset and chat id check out. Body binding not reproducible from here.
 ```
 
-Six checks run, all of which must pass:
+It says "authentic" rather than "verified" deliberately: `verified` is the
+library's own field, and it is `false` on every completion because of the two
+body-hash checks below. Reporting that as a failure would be accurate and
+useless.
+
+Fourteen checks run, and the library's `verified` requires every one of them:
 
 | Check | What it rules out |
 |---|---|
-| `key_in_attested_keyset` | a receipt signed by a key the enclave never vouched for |
+| `verification_context_present` | verifying against a missing or partial trust anchor |
+| `api_version_supported` | a receipt in a protocol version these rules were not written for |
+| `keyset_well_formed` | a malformed keyset that later checks would read loosely |
+| `keyset_digest_matches_trust_anchor` | a substituted keyset — the digest is recomputed, not read |
+| `attestation_keyset_digest_matches_trust_anchor` | the attestation pointing at a different keyset than the anchor |
+| `receipt_keyset_digest_matches_trust_anchor` | the receipt naming a keyset other than the anchored one |
+| `workload_id_matches_trust_anchor` | a receipt from a different workload than the pinned one |
+| `key_in_trusted_keyset` | a receipt signed by a key the enclave never vouched for |
 | `key_algo_matches` | algorithm confusion between receipt and keyset |
 | `receipt_signature` | any edit to the receipt or its event log |
-| `keyset_digest_matches` | a substituted keyset — the digest is folded into the quote's `report_data` |
 | `chat_id_matches_request` | a valid receipt for somebody else's completion |
-| `signing_address_matches_attestation` | the two endpoints describing different enclaves |
+| `signing_address_cross_check` | the two endpoints describing different enclaves |
+| `request_body_hash_matches` | *(never passes from here — see above)* |
+| `response_body_hash_matches` | *(never passes from here — see above)* |
+
+Four of these compare against the trust anchor rather than against the response,
+which is the point: a provider serving both the receipt and the attestation could
+make them agree with each other, but not with a value pinned earlier. That is
+also why the anchor's own weakness — pinned, not proven — is the first thing this
+section covers.
 
 The signature is Ed25519 over the RFC 8785 (JCS) canonicalization of the receipt
 with `signature.value` removed, under a key from
@@ -429,15 +548,32 @@ single boolean.
 
 ### GPU attestation
 
-Off by default. Turn it on with `verify_gpu_attestation: true` (or
-`VERIFY_GPU_ATTESTATION=true`) and sessions fail closed unless NVIDIA vouches for
-the GPU evidence Venice served, with a nonce proving the verdict is about your
-request.
+**On by default.** Sessions fail closed unless NVIDIA vouches for the GPU
+evidence Venice served, with a nonce proving the verdict is about your request.
+It applies to both paths — `e2ee-` and `tee-` models go through the same
+attestation handshake, so both are gated.
 
 ```yaml
-verify_attestation: true          # required — GPU evidence is checked as part of it
-verify_gpu_attestation: true
+verify_gpu_attestation: false     # to switch it off
 ```
+
+Turning it off leaves the GPU vouched for only by Venice, which is the thing
+this proxy otherwise exists to avoid. The reason it might be worth doing is
+availability: with it on, sessions depend on NVIDIA being reachable, in the same
+way `enable_dcap` already makes them depend on a PCCS. Attestation itself must
+stay on — switching `verify_attestation` off turns this off with it, since there
+is then no attestation to check GPU evidence against.
+
+Measured cost, against the live API:
+
+```
+attestation only            1753 ms
++ GPU verification          1709 ms      (noise — NRAS is not the slow part)
++ token signatures          1934 ms      (first call; JWKS cached for 12h after)
+```
+
+Once per session, not once per request, so a 30-minute TTL amortises it to
+roughly nothing.
 
 Venice's attestation response carries an `nvidia_payload` alongside
 `server_verification.nvidia.valid`. That second field is Venice's own verdict on
@@ -470,8 +606,10 @@ e2ee-gpt-oss-20b-p     12103 B    1      HOPPER   GH100, secboot ✓ dbgstat=dis
 e2ee-glm-5-2-p         98158 B    8      HOPPER   GH100 ×8, all passing, eat_nonce bound
 ```
 
-7 of the 9 E2EE models that answered a sweep carried GPU evidence; the other two
-returned 502 or 429 rather than an empty payload.
+Every E2EE model that answered a full sweep carried GPU evidence — 13 of 13. The
+three that did not answer returned 502 from Venice's attestation endpoint, and
+those already fail with plain `verify_attestation`, GPU checking or not. So
+turning this on costs no model that works today.
 
 **What this does not establish is co-location.** The attested CVM's `vm_config`
 reports `num_gpus: 0` and `cpu_count: 16` — the enclave holding the signing key
@@ -895,25 +1033,53 @@ OpenAI-compatible backend. Add the proxy as a provider in
           "limit": { "context": 32000, "output": 4096 },
           "cost": { "input": 0.182, "output": 1.18 }
         },
-        "e2ee-gemma-4-31b": {
-          "name": "Gemma 4 31B Instruct (E2EE)",
+        "tee-e2ee-glm-5-2-p": {
+          "name": "GLM 5.2 (TEE)",
+          "tool_call": true,
+          "reasoning": true,
+          "attachment": false,
+          "limit": { "context": 524288, "output": 32768 },
+          "cost": { "input": 1.75, "output": 5.75 }
+        },
+        "tee-e2ee-deepseek-v4-flash": {
+          "name": "DeepSeek V4 Flash (TEE)",
+          "tool_call": true,
+          "reasoning": true,
+          "attachment": false,
+          "limit": { "context": 1000000, "output": 8192 },
+          "cost": { "input": 0.182, "output": 0.373 }
+        },
+        "tee-e2ee-qwen3-6-27b": {
+          "name": "Qwen 3.6 27B FP8 (TEE)",
+          "tool_call": true,
+          "reasoning": true,
+          "attachment": false,
+          "limit": { "context": 256000, "output": 32768 },
+          "cost": { "input": 0.346, "output": 3.46 }
+        },
+        "tee-e2ee-qwen3-6-35b-a3b": {
+          "name": "Qwen 3.6 35B A3B FP8 (TEE)",
           "tool_call": true,
           "reasoning": true,
           "attachment": false,
           "limit": { "context": 32000, "output": 4096 },
-          "cost": { "input": 0.139, "output": 0.43 }
+          "cost": { "input": 0.182, "output": 1.18 }
         }
       }
     }
   },
-  "model": "venice-e2ee/e2ee-glm-5-2-p",
-  "small_model": "venice-e2ee/e2ee-qwen3-6-35b-a3b"
+  "model": "venice-e2ee/tee-e2ee-glm-5-2-p",
+  "small_model": "venice-e2ee/tee-e2ee-qwen3-6-35b-a3b"
 }
 ```
 
-Adjust `baseURL` to match your `port` setting. The `apiKey` is unused — the
-proxy reads `VENICE_API_KEY` from the environment. A sample config is also
-in [`opencode.example.json`](opencode.example.json).
+Only E2EE models with `supportsFunctionCalling: true` that also pass a live
+attestation probe are listed — opencode is an agent and needs reliable tool
+calls. The `tee-` variants are the defaults: Venice's native function calling
+works on that path, while the `e2ee-` path's prompt-based tool parsing is
+best-effort (see [E2EE tool calling is best-effort](#e2ee-tool-calling-is-best-effort)).
+The `e2ee-` entries remain selectable for non-tool or max-privacy turns. A
+sample config is also in [`opencode.example.json`](opencode.example.json).
 
 ## Testing
 

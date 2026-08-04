@@ -41,18 +41,22 @@ enable_dcap: true
 # dcap_pccs_url: "https://your-pccs.example/sgx/certification/v4"
 
 # Check the GPU evidence Venice serves against NVIDIA rather than against
-# Venice's own verdict on it (default false). Requires verify_attestation.
+# Venice's own verdict on it (default true). Applies to both e2ee- and tee-
+# models, which share the same attestation handshake.
 #
-# When true, session creation fails unless NVIDIA's Remote Attestation Service
-# vouches for the evidence AND its eat_nonce matches the nonce this session
-# sent — so the verdict is about your request, not a replayed report. Secure
-# boot, debug status and measurement results are checked per GPU. It also fails
-# when no GPU evidence is served, so the check cannot be skipped by omitting it.
+# Session creation fails unless NVIDIA's Remote Attestation Service vouches for
+# the evidence AND its eat_nonce matches the nonce this session sent — so the
+# verdict is about your request, not a replayed report. Secure boot, debug
+# status and measurement results are checked per GPU. It also fails when no GPU
+# evidence is served, so the check cannot be skipped by omitting it.
 #
-# Costs one round trip to NVIDIA per session, and tells NVIDIA the evidence was
-# checked. Read the GPU attestation section of the README first: a passing check
-# does not prove the GPU is the machine that ran your prompt.
-verify_gpu_attestation: false
+# The cost is one NRAS round trip per session, which measures as noise next to
+# the attestation handshake. The real trade is availability: sessions depend on
+# NVIDIA being reachable, as enable_dcap already makes them depend on a PCCS.
+#
+# Read the GPU attestation section of the README before relying on this: a
+# passing check does not prove the GPU is the machine that ran your prompt.
+verify_gpu_attestation: true
 
 # Point GPU verification at your own verifier instead of NVIDIA's public NRAS.
 # nras_url: "https://your-verifier.example/v3/attest/gpu"
@@ -137,11 +141,15 @@ log_level: "info"
 # Function Calling section of the README.
 #
 # Not every E2EE model supports tools. Verified working with function calling
-# over E2EE (July 2026):
+# over E2EE (Aug 2026):
 #   e2ee-glm-5-2-p        524K ctx  32K out  $1.75/$5.75 per M tokens
 #   e2ee-deepseek-v4-flash 1M ctx   8K out  $0.182/$0.373
 #   e2ee-qwen3-6-27b      256K ctx  32K out  $0.346/$3.46
 #   e2ee-qwen3-6-35b-a3b   32K ctx   4K out  $0.182/$1.18
+# (e2ee-gemma-4-31b was listed here previously — it advertises reasoning but
+#  NOT function calling, and was never a valid agent model. Removed.)
+# e2ee-qwen3-30b-a3b-p and e2ee-qwen3-vl-30b-a3b-p advertise FC but the
+# attestation endpoint 502s — re-probe before adding.
 #   e2ee-gemma-4-31b       32K ctx   4K out  $0.139/$0.43
 # Check the current list:
 #   curl -H "Authorization: Bearer $VENICE_API_KEY" \

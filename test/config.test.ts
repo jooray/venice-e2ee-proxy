@@ -22,24 +22,35 @@ describe('loadConfig — GPU attestation', () => {
     process.env = { ...saved };
   });
 
-  it('leaves GPU attestation off by default', () => {
-    expect(loadConfig(NO_FILE).verify_gpu_attestation).toBe(false);
-  });
-
-  it('enables it from the environment', () => {
-    process.env.VERIFY_GPU_ATTESTATION = 'true';
+  it('checks GPU attestation by default', () => {
     expect(loadConfig(NO_FILE).verify_gpu_attestation).toBe(true);
   });
 
-  it('treats any value other than true/1 as off, so typos fail safe-to-run', () => {
-    process.env.VERIFY_GPU_ATTESTATION = 'yes';
+  it('can be switched off explicitly', () => {
+    process.env.VERIFY_GPU_ATTESTATION = 'false';
+    expect(loadConfig(NO_FILE).verify_gpu_attestation).toBe(false);
+    process.env.VERIFY_GPU_ATTESTATION = '0';
     expect(loadConfig(NO_FILE).verify_gpu_attestation).toBe(false);
   });
 
-  it('rejects GPU attestation without attestation verification', () => {
+  it('keeps checking on a typo rather than silently disabling', () => {
+    process.env.VERIFY_GPU_ATTESTATION = 'no';
+    expect(loadConfig(NO_FILE).verify_gpu_attestation).toBe(true);
+  });
+
+  it('rejects GPU attestation explicitly asked for without attestation verification', () => {
     process.env.VERIFY_GPU_ATTESTATION = 'true';
     process.env.VERIFY_ATTESTATION = 'false';
     expect(() => loadConfig(NO_FILE)).toThrow(/requires verify_attestation/);
+  });
+
+  it('follows attestation off, rather than refusing to start', () => {
+    // Someone running with attestation disabled should not be broken by the
+    // GPU default turning on underneath them.
+    process.env.VERIFY_ATTESTATION = 'false';
+    const config = loadConfig(NO_FILE);
+    expect(config.verify_attestation).toBe(false);
+    expect(config.verify_gpu_attestation).toBe(false);
   });
 
   it('carries an NRAS override through', () => {

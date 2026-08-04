@@ -41,17 +41,41 @@
           "limit": { "context": 32000, "output": 4096 },
           "cost": { "input": 0.182, "output": 1.18 }
         },
-        "e2ee-gemma-4-31b": {
-          "name": "Gemma 4 31B Instruct (E2EE)",
+        "tee-e2ee-glm-5-2-p": {
+          "name": "GLM 5.2 (TEE)",
+          "tool_call": true,
+          "reasoning": true,
+          "attachment": false,
+          "limit": { "context": 524288, "output": 32768 },
+          "cost": { "input": 1.75, "output": 5.75 }
+        },
+        "tee-e2ee-deepseek-v4-flash": {
+          "name": "DeepSeek V4 Flash (TEE)",
+          "tool_call": true,
+          "reasoning": true,
+          "attachment": false,
+          "limit": { "context": 1000000, "output": 8192 },
+          "cost": { "input": 0.182, "output": 0.373 }
+        },
+        "tee-e2ee-qwen3-6-27b": {
+          "name": "Qwen 3.6 27B FP8 (TEE)",
+          "tool_call": true,
+          "reasoning": true,
+          "attachment": false,
+          "limit": { "context": 256000, "output": 32768 },
+          "cost": { "input": 0.346, "output": 3.46 }
+        },
+        "tee-e2ee-qwen3-6-35b-a3b": {
+          "name": "Qwen 3.6 35B A3B FP8 (TEE)",
           "tool_call": true,
           "reasoning": true,
           "attachment": false,
           "limit": { "context": 32000, "output": 4096 },
-          "cost": { "input": 0.139, "output": 0.43 }
+          "cost": { "input": 0.182, "output": 1.18 }
         }
       }
     }
   },
-  "model": "venice-e2ee/e2ee-glm-5-2-p",
-  "small_model": "venice-e2ee/e2ee-qwen3-6-35b-a3b"
+  "model": "venice-e2ee/tee-e2ee-glm-5-2-p",
+  "small_model": "venice-e2ee/tee-e2ee-qwen3-6-35b-a3b"
 }

@@ -18,11 +18,15 @@ export interface ProxyConfig {
   dcap_pccs_url?: string;
   /**
    * Check the GPU evidence Venice serves against NVIDIA rather than against
-   * Venice's own verdict on it. Off by default: it costs an NRAS round trip per
-   * session and tells NVIDIA the evidence was checked.
+   * Venice's own verdict on it. On by default, and fails closed — including
+   * when no GPU evidence is served at all, since otherwise the check could be
+   * skipped by omitting the payload.
    *
-   * When on, it fails closed — including when no GPU evidence is served at all.
-   * A GPU check that only logs is the check Venice already self-reports.
+   * The cost is one NRAS round trip per session, which measures as noise beside
+   * the attestation handshake itself. The real trade is availability: sessions
+   * now depend on NVIDIA being reachable, the same way `enable_dcap` already
+   * makes them depend on a PCCS. Set false if that coupling is not worth it,
+   * accepting that the GPU is then vouched for only by Venice.
    */
   verify_gpu_attestation: boolean;
   /** Override the NRAS endpoint (a self-hosted verifier, or an air-gapped stub). */
@@ -61,7 +65,7 @@ const DEFAULTS: Omit<ProxyConfig, 'venice_api_key'> = {
   venice_base_url: 'https://api.venice.ai',
   verify_attestation: true,
   enable_dcap: true,
-  verify_gpu_attestation: false,
+  verify_gpu_attestation: true,
   verify_gpu_token_signatures: true,
   gpu_pinned_certs: [],
   verify_receipts: false,
@@ -106,8 +110,10 @@ export function loadConfig(configPath?: string): ProxyConfig {
   }
   if (process.env.DCAP_PCCS_URL) envOverrides.dcap_pccs_url = process.env.DCAP_PCCS_URL;
   if (process.env.VERIFY_GPU_ATTESTATION !== undefined) {
+    // Only an explicit false/0 disables it. Now that the default is on, a typo
+    // has to leave the check running rather than quietly switch it off.
     envOverrides.verify_gpu_attestation =
-      process.env.VERIFY_GPU_ATTESTATION === 'true' || process.env.VERIFY_GPU_ATTESTATION === '1';
+      process.env.VERIFY_GPU_ATTESTATION !== 'false' && process.env.VERIFY_GPU_ATTESTATION !== '0';
   }
   if (process.env.NRAS_URL) envOverrides.nras_url = process.env.NRAS_URL;
   if (process.env.NRAS_JWKS_URL) envOverrides.nras_jwks_url = process.env.NRAS_JWKS_URL;
@@ -159,9 +165,22 @@ export function loadConfig(configPath?: string): ProxyConfig {
   // Caught here rather than at the first request, where the library would throw
   // the same objection with far less context about which setting caused it.
   if (merged.verify_gpu_attestation && !merged.verify_attestation) {
-    throw new Error(
-      'verify_gpu_attestation requires verify_attestation. GPU evidence is checked as part of ' +
-      'attestation, so it cannot be enforced while attestation is switched off.'
+    // Only a contradiction if both were asked for. Turning attestation off and
+    // leaving the GPU default alone is a coherent choice, and now that the
+    // default is on it must not start refusing to boot for those setups.
+    const gpuWasRequested =
+      'verify_gpu_attestation' in fileConfig || 'verify_gpu_attestation' in envOverrides;
+
+    if (gpuWasRequested) {
+      throw new Error(
+        'verify_gpu_attestation requires verify_attestation. GPU evidence is checked as part of ' +
+        'attestation, so it cannot be enforced while attestation is switched off.'
+      );
+    }
+    merged.verify_gpu_attestation = false;
+    console.warn(
+      'Attestation verification is off, so GPU attestation is off too — there is no attestation ' +
+      'to check GPU evidence against.'
     );
   }
 
