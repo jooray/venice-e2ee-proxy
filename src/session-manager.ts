@@ -24,9 +24,57 @@ export type ReceiptOutcome =
       result: ReceiptVerification;
       /** False when the only failures are the two body-hash checks. */
       bodyBindingOk: boolean;
+      /** What the gateway recorded about the node it forwarded to, if anything. */
+      upstream: UpstreamVerification | null;
     }
   | { status: 'unavailable'; reason: string }
   | { status: 'anchor-conflict'; reason: string };
+
+/**
+ * The gateway's own record of checking the machine it forwarded your prompt to.
+ *
+ * The receipt's fourteen checks say nothing about this: they establish that the
+ * attested enclave signed a receipt for your completion, not what that enclave
+ * found when it looked at its upstream. The verdict is in the signed event log
+ * either way, so a failure is already recorded. It just was not being read.
+ */
+export interface UpstreamVerification {
+  /** `verified` when the gateway checked the node's quote and bound the channel. */
+  result: string;
+  /** False means the check ran but was not allowed to block the request. */
+  required: boolean;
+  origin?: string;
+  verifierId?: string;
+  reason?: string;
+  /** Claims the gateway could not establish, such as `gpu_attested`. */
+  unknownClaims: string[];
+}
+
+/** Pull the `upstream.verified` event out of a signed receipt's event log. */
+export function readUpstreamVerification(signature: unknown): UpstreamVerification | null {
+  const log = (signature as { receipt?: { event_log?: unknown } } | null)?.receipt?.event_log;
+  if (!Array.isArray(log)) return null;
+
+  const event = log.find(
+    (entry): entry is Record<string, unknown> =>
+      typeof entry === 'object' && entry !== null && (entry as { type?: unknown }).type === 'upstream.verified'
+  );
+  if (!event) return null;
+
+  const claims = (event.claims ?? {}) as Record<string, { status?: unknown } | null>;
+  const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
+
+  return {
+    result: str(event.result) ?? 'unknown',
+    required: event.required === true,
+    origin: str(event.url_origin),
+    verifierId: str(event.verifier_id),
+    reason: str(event.reason),
+    unknownClaims: Object.entries(claims)
+      .filter(([, value]) => value?.status === 'unknown')
+      .map(([name]) => name),
+  };
+}
 
 /**
  * The checks that bind a receipt to specific request and response bytes.
@@ -293,6 +341,7 @@ export class SessionManager {
       anchorSource: resolution.source,
       result,
       bodyBindingOk: !failed.some((check) => BODY_BINDING_CHECKS.has(check.name)),
+      upstream: readUpstreamVerification(signature),
     };
   }
 

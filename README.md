@@ -261,9 +261,46 @@ So the chain is transitive rather than absent: you attest the gateway, the gatew
 
 `required: false` means the check was not enforced for this route. The gateway runs the verifier either way, but the fail-closed gate that refuses to forward on a failed check is off, so a failure here would be recorded in the receipt rather than blocking your prompt. The gateway does support enforcement (`provider.aci_verified: true`, which the source gates before any upstream IO), but Venice's API rejects that field outright with `400 Unrecognized key(s) in object: 'provider'`, so a client cannot demand it through Venice today.
 
-The route is also not stable. Observed verifiers across requests to one model included `aci-service/v2` and `private-ai-verifier/chutes/v1`, so which upstream answers, and which verifier judges it, can change between requests.
+The route is also not stable, and not to one provider. Three different upstreams answered requests for `e2ee-glm-5-2-p` within an hour:
+
+```
+https://glm-5-2.aus1-router.phala.com    aci-service/v2
+(chutes)                                 private-ai-verifier/chutes/v1
+https://cloud-api.near.ai                private-ai-verifier/near-ai-gateway/v1
+```
+
+So which company's hardware decrypts your prompt varies per request, and the last of those is itself a gateway that forwards again. Set `verify_receipts: true` and the proxy names the upstream for each model, which is the only way to see where a given completion actually went.
 
 The remaining claims are the honest part, and they are the gateway's own assessment of what it could not establish: `gpu_attested`, `tcb_up_to_date`, `os_known_good`, `serving_software_known_good` and `model_weights_provenance` all read `unknown`. The inference node proves it is a TEE running a measured workload. It does not prove its GPU is attested, nor what weights it loaded.
+
+With `verify_receipts: true` the proxy reports this per model, and logs an error on every completion where the gateway did not verify its upstream:
+
+```
+INFO  Gateway verified the upstream to https://cloud-api.near.ai for e2ee-glm-5-2-p
+      (private-ai-verifier/near-ai-gateway/v1, not enforced, a failure would not have blocked
+      the request). Not established: gpu_attested, os_known_good,
+      serving_software_known_good, model_weights_provenance.
+```
+
+Without receipts on, none of this is visible: the verdict is only ever carried inside the receipt.
+
+### Does attestation tell you nothing is logged?
+
+No, and for the gateway the attestation says the opposite. The measured compose file sets
+
+```
+- RUST_LOG=info,request_outcome=debug
+```
+
+with its own comment that `request_outcome=debug` "turns on the raw error-detail field of the per-request failure log", that "upstream error bodies may echo request fragments into these operator-visible logs", and that dropping it "falls back to content-free failure logging only". The same file configures 500 MB x 10 rotated log files, described there as "roughly a month of retention on the persistent volume for incident forensics".
+
+So the attested configuration provisions about 5 GB of retained logs and selects a verbosity its own authors flag as capable of containing request fragments. That is measured, which is the point: attestation made it visible rather than hiding it.
+
+Beyond configuration, the gateway binary is built from source at boot, so what the quote fixes is an instruction to build a commit rather than the artifact that ran. Reading the pinned commit tells you what it should do; nothing measures what the build produced.
+
+For the inference node it is simpler. The gateway attests that the node is a TEE running a measured workload, and reports `serving_software_known_good: unknown`. It does not know what that software does, and neither do you.
+
+What attestation gives you here is not "nothing is logged" but a specific, checkable configuration, and a receipt trail when something is not verified.
 
 ### What the GPU attestation actually proves
 

@@ -1,6 +1,6 @@
 import type { Request, Response } from 'express';
 import type { ProxyConfig } from './config.js';
-import { SessionManager, stripTeePrefix } from './session-manager.js';
+import { SessionManager, stripTeePrefix, type UpstreamVerification } from './session-manager.js';
 import { logger } from './logger.js';
 import { debugDump } from './debug-dump.js';
 import {
@@ -37,6 +37,61 @@ interface ChatCompletionRequest {
 function isRetriableSessionFailure(message: string): boolean {
   if (/GPU attestation|NVIDIA|NRAS/i.test(message)) return false;
   return message.includes('attestation') || message.includes('TEE');
+}
+
+/** Models whose upstream posture has been described once already. */
+const reportedUpstreamModels = new Set<string>();
+
+/**
+ * Report what the gateway found when it checked the machine it forwarded to.
+ *
+ * This lives in the receipt's signed event log and nothing was reading it, so a
+ * gateway that failed to verify its upstream and forwarded anyway looked
+ * identical to one that verified successfully. A failure is logged on every
+ * completion, because it means your prompt went somewhere unattested; the
+ * healthy case is described once per model so it does not become noise.
+ */
+function reportUpstreamVerification(
+  modelId: string,
+  requestId: string,
+  upstream: UpstreamVerification | null
+): void {
+  if (!upstream) {
+    if (!reportedUpstreamModels.has(modelId)) {
+      reportedUpstreamModels.add(modelId);
+      logger.warn(
+        `Receipt for ${modelId} records no upstream verification. The gateway did not report ` +
+        `checking the machine it forwarded your prompt to.`
+      );
+    }
+    return;
+  }
+
+  const where = upstream.origin ? ` to ${upstream.origin}` : '';
+
+  if (upstream.result !== 'verified') {
+    logger.error(
+      `Gateway did NOT verify the upstream${where} for ${requestId} (${modelId}): ` +
+      `result=${upstream.result}${upstream.reason ? `, ${upstream.reason}` : ''}. ` +
+      (upstream.required
+        ? 'The request should have been refused before forwarding.'
+        : 'It forwarded your prompt anyway, because verification is not enforced on this route.')
+    );
+    return;
+  }
+
+  if (reportedUpstreamModels.has(modelId)) return;
+  reportedUpstreamModels.add(modelId);
+
+  const unknown = upstream.unknownClaims.length
+    ? ` Not established: ${upstream.unknownClaims.join(', ')}.`
+    : '';
+  logger.info(
+    `Gateway verified the upstream${where} for ${modelId} ` +
+    `(${upstream.verifierId ?? 'unnamed verifier'}, ` +
+    `${upstream.required ? 'enforced' : 'not enforced, a failure would not have blocked the request'}).` +
+    unknown
+  );
 }
 
 /** Models already warned about, so a long agent session says this once. */
@@ -300,6 +355,8 @@ export class ProxyHandler {
           debugDump('receipt', { model: upstreamModel, request_id: requestId, ...outcome });
           return;
         }
+
+        reportUpstreamVerification(upstreamModel, requestId, outcome.upstream);
 
         const { result, anchorSource, bodyBindingOk } = outcome;
         const failed = result.checks.filter((check) => !check.ok);
