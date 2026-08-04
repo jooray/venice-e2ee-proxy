@@ -34,10 +34,28 @@ verify_attestation: true
 enable_dcap: true
 
 # Verify the signed receipt for each completion (default false).
-# Attestation proves an enclave exists; the receipt proves your particular
-# completion came out of it. Costs two extra round trips per request, run after
-# the response is already sent, so results are logged rather than returned.
+# Attestation proves an enclave exists; the receipt proves the enclave signed a
+# receipt for your completion id. Costs two extra round trips per request, run
+# after the response is already sent, so results are logged rather than returned.
+#
+# Read the Response Receipts section of the README before relying on this. Two
+# limits, both measured rather than assumed:
+#   - the trust anchor is pinned on first use, not cryptographically proven
+#   - the request/response body hashes cannot be reproduced from behind
+#     api.venice.ai, so those two checks never pass
 verify_receipts: false
+
+# Where trust-on-first-use receipt anchors are recorded. Read once at startup,
+# so removing a stale pin needs a restart.
+receipt_anchor_store: ".venice-receipt-anchors.json"
+
+# Anchors you established out of band. These win over anything pinned on first
+# use, and a disagreement with the attestation is reported as a conflict rather
+# than adopted. Leave empty to rely on first-use pinning.
+# receipt_anchors:
+#   e2ee-glm-5-2-p:
+#     workloadId: "sha256:3def476b..."
+#     workloadKeysetDigest: "sha256:c5c0f582..."
 
 # Session TTL in milliseconds (default: 30 minutes)
 # E2EE sessions are cached per model. After TTL expires, a new session

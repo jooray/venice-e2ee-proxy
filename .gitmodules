@@ -1,4 +1,4 @@
 [submodule "venice-e2ee"]
 	path = venice-e2ee
 	url = https://github.com/jooray/venice-e2ee.git
-	branch = feat/response-receipts
+	branch = fix/tool-call-parsing

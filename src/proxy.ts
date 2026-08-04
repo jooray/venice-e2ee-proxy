@@ -24,6 +24,78 @@ interface ChatCompletionRequest {
   [key: string]: unknown;
 }
 
+/** Models already warned about, so a long agent session says this once. */
+const warnedE2EEToolModels = new Set<string>();
+const reportedReceiptlessModels = new Set<string>();
+
+/**
+ * Note that a model's gateway does not issue receipts.
+ *
+ * `e2ee-deepseek-v4-flash` is the live example: it attests as Intel TDX and
+ * serves E2EE traffic normally, but its attestation is the pre-ACI shape with no
+ * `workload_id`, no keyset and nothing to check a receipt against. Nothing is
+ * wrong with the request, so this is info rather than a warning, and once per
+ * model rather than once per completion.
+ */
+const warnedBodyBindingModels = new Set<string>();
+
+/**
+ * Say once that a receipt's body binding cannot be checked from here.
+ *
+ * This is the part of a receipt that would prove the bytes in hand are the ones
+ * the enclave produced, and it is the part this proxy cannot reach: Venice
+ * re-serializes between here and the ACI gateway, so the hashes never line up.
+ * Worth stating plainly rather than burying, because it bounds what a verified
+ * receipt actually tells you.
+ */
+function warnBodyBindingUnavailable(modelId: string): void {
+  if (warnedBodyBindingModels.has(modelId)) return;
+  warnedBodyBindingModels.add(modelId);
+  logger.warn(
+    `Receipt body binding cannot be verified for ${modelId}: Venice re-serializes between this ` +
+      `proxy and the enclave that issues the receipt, so request/response hashes never match. ` +
+      `Receipts still prove the enclave signed a receipt for this completion id — not that the ` +
+      `bytes you received are the ones it produced.`
+  );
+}
+
+function warnReceiptsUnavailable(modelId: string, reason: string): void {
+  if (reportedReceiptlessModels.has(modelId)) return;
+  reportedReceiptlessModels.add(modelId);
+  logger.info(`Receipts unavailable for ${modelId}: ${reason}. Completions are unaffected.`);
+}
+
+/**
+ * Warn that function calling over E2EE is best-effort.
+ *
+ * Venice's E2EE gateway drops the `tools` parameter, so the schemas have to ride
+ * inside the prompt and the model's tool calls have to be parsed back out of
+ * prose. GLM does not reliably emit the format the prompt asks for: across
+ * captured sessions it produced a different malformed syntax almost every run,
+ * and roughly a quarter of its tool calls could not be recovered without
+ * guessing at where one argument ended and the next began.
+ *
+ * Guessing was tried and removed. It turned lost calls into plausible-looking
+ * wrong ones, which is the worse failure — a `grep` with a truncated pattern
+ * looks like it worked. So the parser now handles the well-formed shapes and a
+ * few mechanical repairs, and anything past that surfaces as text.
+ *
+ * The `tee-` prefix has none of this: the request stays inside an attested
+ * enclave and Venice's own function calling handles the tool schemas natively.
+ * Prompts are not end-to-end encrypted on that path — it is a real trade, not a
+ * strict upgrade — but for agent workloads it is the one that works.
+ */
+function warnAboutE2EEToolCalling(modelId: string): void {
+  if (warnedE2EEToolModels.has(modelId)) return;
+  warnedE2EEToolModels.add(modelId);
+  logger.warn(
+    `Function calling over E2EE is best-effort: ${modelId} is prompted to emit tool calls as text, ` +
+      `and malformed ones surface as content instead of a call. For agent use prefer ` +
+      `tee-${modelId}, which keeps the attested enclave and uses Venice's native function calling ` +
+      `(prompts are not E2EE on that path).`
+  );
+}
+
 /**
  * Core proxy handler for /v1/chat/completions.
  *
@@ -117,13 +189,15 @@ export class ProxyHandler {
       const veniceUrl = `${this.config.venice_base_url}/api/v1/chat/completions`;
       logger.debug(`Forwarding plaintext TEE request to ${veniceUrl}`);
 
+      const veniceRequestBody = JSON.stringify(veniceBody);
+
       const veniceRes = await fetch(veniceUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${this.config.venice_api_key}`,
         },
-        body: JSON.stringify(veniceBody),
+        body: veniceRequestBody,
       });
 
       res.status(veniceRes.status);
@@ -142,14 +216,15 @@ export class ProxyHandler {
       // next request would otherwise drop to the E2EE path on turn two and lose
       // their tools.
       if (body.stream === true) {
+        const wire = { raw: '' };
         const upstreamId = await this.streamTeeOnlyResponse(
-          veniceRes, res, upstreamModel, clientModel
+          veniceRes, res, upstreamModel, clientModel, wire
         );
-        this.verifyReceiptInBackground(upstreamModel, upstreamId);
+        this.verifyReceiptInBackground(upstreamModel, upstreamId, veniceRequestBody, wire.raw);
       } else {
         const text = await veniceRes.text();
         res.send(rewriteModelField(text, upstreamModel, clientModel));
-        this.verifyReceiptInBackground(upstreamModel, completionId(text));
+        this.verifyReceiptInBackground(upstreamModel, completionId(text), veniceRequestBody, text);
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
@@ -175,22 +250,78 @@ export class ProxyHandler {
    * and blocking every completion on two extra round trips to prove what already
    * happened is a bad trade. Failures are logged, never surfaced to the client.
    */
-  private verifyReceiptInBackground(upstreamModel: string, requestId: string | null): void {
+  private verifyReceiptInBackground(
+    upstreamModel: string,
+    requestId: string | null,
+    requestBody: string,
+    responseBody: string
+  ): void {
     if (!this.config.verify_receipts || !requestId) return;
 
     this.sessionManager
-      .verifyReceipt(upstreamModel, requestId)
-      .then((result) => {
+      .verifyReceipt(upstreamModel, requestId, {
+        requestBody,
+        responseBody,
+        responseHashField: 'wire_hash',
+      })
+      .then((outcome) => {
+        if (outcome.status === 'unavailable') {
+          // Not a failure: this gateway predates receipts. Said once per model,
+          // at info, so it does not read as an alarm on every completion.
+          warnReceiptsUnavailable(upstreamModel, outcome.reason);
+          return;
+        }
+
+        if (outcome.status === 'anchor-conflict') {
+          logger.error(
+            `Receipt anchor CHANGED for ${upstreamModel} — ${outcome.reason}. ` +
+              `The workload serving this model is not the one pinned. Investigate before trusting ` +
+              `these completions; if the change is expected, remove the entry from ` +
+              `${this.config.receipt_anchor_store}.`
+          );
+          debugDump('receipt', { model: upstreamModel, request_id: requestId, ...outcome });
+          return;
+        }
+
+        const { result, anchorSource, bodyBindingOk } = outcome;
         const failed = result.checks.filter((check) => !check.ok);
+        const otherFailures = failed.filter(
+          (c) => c.name !== 'request_body_hash_matches' && c.name !== 'response_body_hash_matches'
+        );
+        // A first-seen anchor was recorded from this very exchange, so its four
+        // anchor checks compare Venice against itself. The signature and body
+        // hashes are still meaningful; the anchor is not, and saying "verified"
+        // without that caveat would overstate it.
+        const anchorNote =
+          anchorSource === 'first-seen'
+            ? ' (anchor recorded on this request — pinned, not yet corroborated)'
+            : anchorSource === 'config'
+              ? ' (anchor from config)'
+              : '';
+
         if (result.verified) {
-          logger.info(`Receipt verified for ${requestId} (${upstreamModel})`);
+          logger.info(`Receipt verified for ${requestId} (${upstreamModel})${anchorNote}`);
+        } else if (!bodyBindingOk && otherFailures.length === 0) {
+          // Everything reproducible from here passed. The body hashes cannot be
+          // reproduced behind Venice's API at all, so reporting this as a failed
+          // verification would cry wolf on every single completion.
+          warnBodyBindingUnavailable(upstreamModel);
+          logger.info(
+            `Receipt authentic for ${requestId} (${upstreamModel})${anchorNote}: signature, ` +
+              `keyset and chat id check out. Body binding not reproducible from here.`
+          );
         } else {
           logger.warn(
-            `Receipt NOT verified for ${requestId} (${upstreamModel}): ` +
-            failed.map((c) => `${c.name}${c.detail ? ` — ${c.detail}` : ''}`).join('; ')
+            `Receipt NOT verified for ${requestId} (${upstreamModel})${anchorNote}: ` +
+            otherFailures.map((c) => `${c.name}${c.detail ? ` — ${c.detail}` : ''}`).join('; ')
           );
         }
-        debugDump('receipt', { model: upstreamModel, request_id: requestId, ...result });
+        debugDump('receipt', {
+          model: upstreamModel,
+          request_id: requestId,
+          anchor_source: anchorSource,
+          ...result,
+        });
       })
       .catch((err: unknown) => {
         logger.warn(
@@ -210,7 +341,8 @@ export class ProxyHandler {
     veniceRes: globalThis.Response,
     res: Response,
     from: string,
-    to: string
+    to: string,
+    wire?: { raw: string }
   ): Promise<string | null> {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
@@ -232,7 +364,9 @@ export class ProxyHandler {
         const { done, value } = await reader.read();
         if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
+        const text = decoder.decode(value, { stream: true });
+        if (wire) wire.raw += text;
+        buffer += text;
         const lines = buffer.split('\n');
         // Last element is an unterminated line; hold it until more bytes arrive.
         buffer = lines.pop()!;
@@ -264,7 +398,8 @@ export class ProxyHandler {
       const { session, instance } = await this.sessionManager.getSession(modelId);
       logger.info(`E2EE ${modelId} | attestation: ${session.attestation ? 'verified' : 'skipped'}`);
 
-      // 2. Move function calling into the encrypted channel.
+      // 2. Move function calling into the encrypted channel — see the warning in
+      //    warnAboutE2EEToolCalling for how well that actually works.
       //
       // Venice's E2EE gateway silently drops the `tools` parameter, so passing it
       // through would leave the model unaware of the tools while leaking their
@@ -284,6 +419,7 @@ export class ProxyHandler {
           messages = [{ role: 'system', content: toolPrompt }, ...messages];
         }
         logger.debug(`Injected ${tools!.length} tool schema(s) into the encrypted prompt`);
+        warnAboutE2EEToolCalling(modelId);
       }
 
       debugDump('request', {
@@ -311,6 +447,10 @@ export class ProxyHandler {
       const veniceUrl = `${this.config.venice_base_url}/api/v1/chat/completions`;
       logger.debug(`Forwarding encrypted request to ${veniceUrl}`);
 
+      // Serialized once: the receipt hashes the bytes that were sent, so
+      // re-stringifying later risks hashing a different key order.
+      const veniceRequestBody = JSON.stringify(veniceBody);
+
       const veniceRes = await fetch(veniceUrl, {
         method: 'POST',
         headers: {
@@ -318,7 +458,7 @@ export class ProxyHandler {
           'Authorization': `Bearer ${this.config.venice_api_key}`,
           ...e2eeHeaders,
         },
-        body: JSON.stringify(veniceBody),
+        body: veniceRequestBody,
       });
 
       if (!veniceRes.ok) {
@@ -338,9 +478,9 @@ export class ProxyHandler {
       // the surrounding tags.
       const parserTools = toolPrompt ? tools ?? null : null;
       if (wantStream) {
-        await this.streamE2EEResponse(veniceRes, session, res, parserTools);
+        await this.streamE2EEResponse(veniceRes, session, res, parserTools, veniceRequestBody);
       } else {
-        await this.collectE2EEResponse(veniceRes, session, res, parserTools);
+        await this.collectE2EEResponse(veniceRes, session, res, parserTools, veniceRequestBody);
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
@@ -368,8 +508,16 @@ export class ProxyHandler {
 
   /**
    * Iterate Venice's SSE events, yielding each parsed JSON payload.
+   *
+   * `wire` collects the upstream bytes verbatim when supplied. A receipt's
+   * `response.returned` hash covers what the gateway emitted, not what this proxy
+   * forwards — the model field is rewritten and the events are re-framed on the
+   * way out — so the only bytes worth hashing are the ones captured here.
    */
-  private async *iterateVeniceEvents(veniceRes: globalThis.Response): AsyncGenerator<any> {
+  private async *iterateVeniceEvents(
+    veniceRes: globalThis.Response,
+    wire?: { raw: string }
+  ): AsyncGenerator<any> {
     const reader = veniceRes.body!.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -379,7 +527,9 @@ export class ProxyHandler {
         const { done, value } = await reader.read();
         if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
+        const text = decoder.decode(value, { stream: true });
+        if (wire) wire.raw += text;
+        buffer += text;
         const lines = buffer.split('\n');
         buffer = lines.pop()!;
 
@@ -439,7 +589,8 @@ export class ProxyHandler {
     veniceRes: globalThis.Response,
     session: { privateKey: Uint8Array; modelId: string },
     res: Response,
-    parseTools: ToolDefinition[] | null
+    parseTools: ToolDefinition[] | null,
+    requestBody: string
   ): Promise<void> {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -459,6 +610,7 @@ export class ProxyHandler {
     // Venice's own completion id, which is what the receipt endpoint keys on —
     // the id we emit downstream is generated here and means nothing upstream.
     let upstreamId: string | null = null;
+    const wire = { raw: '' };
 
     const emit = (delta: Record<string, unknown>, reason: string | null = null): void => {
       res.write(`data: ${JSON.stringify({
@@ -476,7 +628,7 @@ export class ProxyHandler {
       }
     };
 
-    for await (const event of this.iterateVeniceEvents(veniceRes)) {
+    for await (const event of this.iterateVeniceEvents(veniceRes, wire)) {
       if (event.usage) usage = event.usage;
       if (!upstreamId && typeof event.id === 'string') upstreamId = event.id;
 
@@ -546,7 +698,7 @@ export class ProxyHandler {
     res.write('data: [DONE]\n\n');
     res.end();
 
-    this.verifyReceiptInBackground(session.modelId, upstreamId);
+    this.verifyReceiptInBackground(session.modelId, upstreamId, requestBody, wire.raw);
   }
 
   /**
@@ -556,16 +708,18 @@ export class ProxyHandler {
     veniceRes: globalThis.Response,
     session: { privateKey: Uint8Array; modelId: string },
     res: Response,
-    parseTools: ToolDefinition[] | null
+    parseTools: ToolDefinition[] | null,
+    requestBody: string
   ): Promise<void> {
     const contentParts: string[] = [];
     const reasoningParts: string[] = [];
+    const wire = { raw: '' };
     let finishReason: string | null = null;
     let created = Math.floor(Date.now() / 1000);
     let usage: Record<string, unknown> | null = null;
     let upstreamId: string | null = null;
 
-    for await (const event of this.iterateVeniceEvents(veniceRes)) {
+    for await (const event of this.iterateVeniceEvents(veniceRes, wire)) {
       if (event.created) created = event.created;
       if (event.usage) usage = event.usage;
       if (!upstreamId && typeof event.id === 'string') upstreamId = event.id;
@@ -601,7 +755,7 @@ export class ProxyHandler {
       if (toolCalls.length > 0) finishReason = 'tool_calls';
     }
 
-    this.verifyReceiptInBackground(session.modelId, upstreamId);
+    this.verifyReceiptInBackground(session.modelId, upstreamId, requestBody, wire.raw);
 
     debugDump('response', {
       model: session.modelId,

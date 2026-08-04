@@ -115,6 +115,7 @@ cp .env.example .env
 | `VENICE_BASE_URL` | `https://api.venice.ai` | Venice API base URL |
 | `VERIFY_ATTESTATION` | `true` | Verify TEE attestation (recommended) |
 | `VERIFY_RECEIPTS` | `false` | Verify the signed receipt for each completion ([details](#response-receipts)) |
+| `RECEIPT_ANCHOR_STORE` | `.venice-receipt-anchors.json` | Where trust-on-first-use receipt anchors are recorded |
 | `ENABLE_DCAP` | `true` | Full DCAP quote verification |
 | `SESSION_TTL` | `1800000` | Session TTL in ms (default: 30 min) |
 | `LOG_LEVEL` | `info` | Log level: debug, info, warn, error |
@@ -229,7 +230,89 @@ proxy logs a warning saying so.
 
 Attestation proves an enclave exists. It says nothing about whether *your* request
 went through it — Venice could serve you from an ordinary GPU and the attestation
-would still check out. The receipt closes that gap.
+would still check out. The receipt narrows that gap, though not as far as it
+first appears. Two limits are worth reading before you rely on it.
+
+#### The trust anchor is pinned, not proven
+
+`verifyReceipt` needs a workload identity and keyset digest it can trust, and
+refuses to take them from the response being checked — a provider serving both
+sides would just make them agree.
+
+There is no cryptographic source for those values today. Venice's TDX quote binds
+the signing address and your nonce (`report_data` decodes as
+`[address(20) | zeros(12) | nonce(32)]`) and says nothing about the ACI keyset
+digest. The `keyset_endorsement` signature sitting next to it could close that
+gap, but its message construction is undocumented — 112 candidate
+reconstructions failed to recover the attested signer, the same wall the
+top-level secp256k1 signature runs into.
+
+So the proxy pins on first use, the way SSH pins a host key. The first
+attestation for a model is recorded to `receipt_anchor_store`
+(`.venice-receipt-anchors.json` by default); every later one has to match. A
+change is an error, not a silent update:
+
+```
+ERROR Receipt anchor CHANGED for e2ee-glm-5-2-p — pinned sha256:3def…/sha256:dead…,
+      attestation now says sha256:3def…/sha256:c5c0…. The workload serving this model
+      is not the one pinned.
+```
+
+This catches a substituted keyset or a silent downgrade. It does **not**
+establish the enclave was genuine at pin time — pin what Venice says and you have
+pinned Venice's claim. The first request says so explicitly (`anchor recorded on
+this request — pinned, not yet corroborated`), and the pin is only corroborated
+by it holding over time. If you have an out-of-band source for the digest, set it
+under `receipt_anchors` and it takes precedence:
+
+```yaml
+receipt_anchors:
+  e2ee-glm-5-2-p:
+    workloadId: "sha256:3def476b…"
+    workloadKeysetDigest: "sha256:c5c0f582…"
+```
+
+The store is read once at startup, so edits to it need a restart.
+
+#### The body binding cannot be checked from here
+
+A receipt carries hashes of the request and response bytes. Measured against the
+live API, **those two checks never pass from behind `api.venice.ai`** — they fail
+identically on the E2EE and TEE-only paths, streaming or not, which places a
+re-serializing hop between this proxy and the enclave that issues the receipt.
+Venice demonstrably re-wraps responses (it adds `cost` and `venice_parameters`),
+and the request hashes point the same way.
+
+The proxy reports this honestly rather than as a failure, since a failure on
+every completion would just teach you to ignore it:
+
+```
+WARN  Receipt body binding cannot be verified for e2ee-glm-5-2-p: Venice re-serializes
+      between this proxy and the enclave that issues the receipt…
+INFO  Receipt authentic for ce0fd827… (e2ee-glm-5-2-p): signature, keyset and chat id
+      check out. Body binding not reproducible from here.
+```
+
+So what a receipt buys you here is that **the attested enclave signed a receipt
+for this completion id** — 11 of 13 checks, including the Ed25519 receipt
+signature, the keyset membership and the anchor. What it does not buy is proof
+that the bytes you received are the ones it produced. Only something sitting
+directly in front of the ACI gateway could establish that.
+
+#### Not every model issues receipts
+
+`e2ee-deepseek-v4-flash` attests as Intel TDX and serves E2EE traffic normally,
+but returns the pre-ACI attestation shape — no `workload_id`, no keyset, nothing
+to check. That is a missing capability, not a failure, and it is reported once
+per model without affecting completions:
+
+```
+INFO  Receipts unavailable for e2ee-deepseek-v4-flash: attestation carries no ACI
+      workload identity (pre-ACI gateway). Completions are unaffected.
+```
+
+`e2ee-glm-5-2-p` and `e2ee-qwen3-30b-a3b-p` share one workload today, so they pin
+to the same anchor — recorded separately, so a move by either is still visible.
 
 Set `verify_receipts: true` (or `VERIFY_RECEIPTS=1`) and the proxy fetches
 `GET /api/v1/tee/signature` after each completion and verifies it, on both the
@@ -326,6 +409,11 @@ single boolean.
 
 ### Function Calling
 
+> **For agent workloads, use the `tee-` prefix, not `e2ee-`.** Function calling
+> over E2EE is best-effort and fails often enough to be unusable for anything
+> that chains tool calls. See [E2EE tool calling is
+> best-effort](#e2ee-tool-calling-is-best-effort) for what actually goes wrong.
+
 Pass `tools` and `tool_choice` exactly as you would with the OpenAI API.
 Verified end-to-end against the live API, on both the E2EE and TEE-only paths:
 
@@ -397,6 +485,49 @@ format nobody has seen yet shows up as a mangled answer instead of an empty turn
 In that session the degenerate form appeared on the first tool call and every
 later turn used clean JSON, which fits the rendered tool history acting as a
 worked example the first call does not have.
+
+### E2EE tool calling is best-effort
+
+Venice's E2EE gateway drops the `tools` parameter, so on the `e2ee-` path the
+schemas have to travel inside the prompt and the model's tool calls have to be
+parsed back out of prose. That last step is the problem: the model has to
+reproduce a format by imitation instead of emitting structured output, and GLM
+does not do it reliably.
+
+Across five captured agent sessions — 48 responses, 96 tool calls — GLM 5.2
+produced a *different* malformed syntax on almost every run. A sample of what
+the same model emitted for the same task on consecutive attempts:
+
+```
+<tool_call>grep pattern="good.?match" include="*.svelte"       attribute pairs
+<tool_call>tasksubagent_type: "explore"description: "…"        name glued to key
+<tool_call>grep{"pattern":"…"}{"path":"…"}                     one object per argument
+<tool_call>readfilePath":"/src/app.css","limit":15}            opening brace absorbed
+<tool_call>edit(filePath:"…", oldString:"…")                   call syntax
+<tool_call>grep\npattern\ngood.?match                          line-delimited
+<tool_call>pattern":"--ok|--accent-bg</arg_value>              no tool name at all
+```
+
+The parser handles the well-formed shapes and a few mechanical repairs —
+unescaped newlines inside JSON strings, unquoted keys, parentheses for braces,
+stray `<arg_key>`/`<arg_value>` tags. **About a quarter of tool calls still do
+not survive**, and those surface as visible markup in the response instead of a
+call.
+
+That is deliberate. Recovering the rest means guessing where one argument ends
+and the next begins, which was implemented and then removed: it converted lost
+calls into plausible-looking wrong ones. A `grep` whose pattern was silently
+truncated looks like it worked, and an `edit` with a corrupted `oldString`
+fails in a way that is much harder to diagnose than a call that visibly did not
+happen. A missing call is recoverable; a wrong one is not.
+
+**Use `tee-` for tool calling.** The request stays inside the attested enclave
+and Venice's native function calling handles the schemas properly, so none of
+the above applies. The trade is real and worth stating plainly: prompts are not
+end-to-end encrypted on that path — Venice can see them, and you are relying on
+the TDX attestation instead. See [TEE-Only Models](#tee-only-models).
+
+The proxy logs a warning the first time it sees `tools` on an `e2ee-` model.
 
 ### Debugging tool-call formats
 

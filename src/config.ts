@@ -10,6 +10,14 @@ export interface ProxyConfig {
   verify_attestation: boolean;
   enable_dcap: boolean;
   verify_receipts: boolean;
+  /** Where trust-on-first-use receipt anchors are recorded. */
+  receipt_anchor_store: string;
+  /**
+   * Anchors supplied by the operator, keyed by model id. These are the only ones
+   * with provenance outside Venice, so they win over anything recorded on first
+   * use — a mismatch is reported as a conflict rather than adopted.
+   */
+  receipt_anchors: Record<string, { workloadId: string; workloadKeysetDigest: string }>;
   session_ttl: number;
   log_level: 'debug' | 'info' | 'warn' | 'error';
 }
@@ -21,6 +29,8 @@ const DEFAULTS: Omit<ProxyConfig, 'venice_api_key'> = {
   verify_attestation: true,
   enable_dcap: true,
   verify_receipts: false,
+  receipt_anchor_store: '.venice-receipt-anchors.json',
+  receipt_anchors: {},
   session_ttl: 30 * 60 * 1000, // 30 minutes
   log_level: 'info',
 };
@@ -61,6 +71,9 @@ export function loadConfig(configPath?: string): ProxyConfig {
   if (process.env.VERIFY_RECEIPTS !== undefined) {
     envOverrides.verify_receipts =
       process.env.VERIFY_RECEIPTS === 'true' || process.env.VERIFY_RECEIPTS === '1';
+  }
+  if (process.env.RECEIPT_ANCHOR_STORE) {
+    envOverrides.receipt_anchor_store = process.env.RECEIPT_ANCHOR_STORE;
   }
   if (process.env.SESSION_TTL) envOverrides.session_ttl = parseInt(process.env.SESSION_TTL, 10);
   if (process.env.LOG_LEVEL) envOverrides.log_level = process.env.LOG_LEVEL;

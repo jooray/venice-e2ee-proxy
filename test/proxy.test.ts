@@ -3,10 +3,27 @@ import { createServer } from '../src/server.js';
 import type { ProxyConfig } from '../src/config.js';
 import type { Express } from 'express';
 import http from 'node:http';
-import { generateKeypair } from 'venice-e2ee';
+import os from 'node:os';
+import path from 'node:path';
+import { generateKeypair, deriveAESKey, encryptMessage } from 'venice-e2ee';
 
 // Generate a valid secp256k1 keypair for the mock TEE
 const mockTeeKeypair = generateKeypair();
+
+/**
+ * Encrypt one response chunk the way the TEE does: a fresh ephemeral keypair per
+ * chunk, ECDH against the client's public key, and the ephemeral public key
+ * prefixed to the ciphertext so the client can derive the same secret.
+ *
+ * The mock has to do this for real. Venice E2EE responses are rejected unless
+ * every chunk is encrypted, so a mock that emitted plaintext would only prove
+ * the proxy accepts a downgrade.
+ */
+async function encryptForClient(clientPubKeyHex: string, plaintext: string): Promise<string> {
+  const ephemeral = generateKeypair();
+  const aesKey = await deriveAESKey(ephemeral.privateKey, clientPubKeyHex);
+  return encryptMessage(aesKey, ephemeral.publicKey, plaintext);
+}
 
 // Helper: create a test config
 function testConfig(overrides?: Partial<ProxyConfig>): ProxyConfig {
@@ -17,6 +34,10 @@ function testConfig(overrides?: Partial<ProxyConfig>): ProxyConfig {
     venice_base_url: 'http://127.0.0.1:0', // will be overridden in tests
     verify_attestation: true,
     enable_dcap: false,
+    verify_receipts: false,
+    // Kept out of the repo: pinning is a side effect and tests should not leave one.
+    receipt_anchor_store: path.join(os.tmpdir(), `venice-anchors-${process.pid}.json`),
+    receipt_anchors: {},
     session_ttl: 1800000,
     log_level: 'error', // quiet during tests
     ...overrides,
@@ -286,25 +307,22 @@ describe('E2EE request handling', () => {
       if (req.method === 'POST' && req.url === '/api/v1/chat/completions') {
         let body = '';
         req.on('data', chunk => body += chunk);
-        req.on('end', () => {
+        req.on('end', async () => {
           lastReceivedBody = JSON.parse(body);
 
           // Check for E2EE headers
-          const hasE2EEHeaders = req.headers['x-venice-tee-client-pub-key'] &&
-            req.headers['x-venice-tee-model-pub-key'];
+          const clientPubKey = req.headers['x-venice-tee-client-pub-key'] as string | undefined;
+          const hasE2EEHeaders = clientPubKey && req.headers['x-venice-tee-model-pub-key'];
 
           if (hasE2EEHeaders) {
-            // For E2EE requests, Venice returns encrypted chunks
-            // Since we can't actually encrypt in the mock, we'll return
-            // plaintext short strings (which pass through decryptChunk as-is)
             res.writeHead(200, {
               'Content-Type': 'text/event-stream',
               'Cache-Control': 'no-cache',
             });
-            // Short non-hex strings pass through decryptChunk as plaintext
-            res.write('data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}\n\n');
-            res.write('data: {"choices":[{"delta":{"content":" from"},"finish_reason":null}]}\n\n');
-            res.write('data: {"choices":[{"delta":{"content":" E2EE"},"finish_reason":null}]}\n\n');
+            for (const text of ['Hello', ' from', ' E2EE']) {
+              const content = await encryptForClient(clientPubKey, text);
+              res.write(`data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: null }] })}\n\n`);
+            }
             res.write('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n');
             res.write('data: [DONE]\n\n');
             res.end();
@@ -465,7 +483,7 @@ describe('E2EE function calling', () => {
   let proxyServer: http.Server;
   let sessionManager: ReturnType<typeof createServer>['sessionManager'];
   let lastReceivedBody: any;
-  /** Chunks the mock TEE emits as assistant content (plaintext passes through decryptChunk). */
+  /** Chunks the mock TEE emits as assistant content, encrypted on the way out. */
   let responseChunks: string[] = [];
 
   const weatherTool = {
@@ -497,11 +515,13 @@ describe('E2EE function calling', () => {
       if (req.method === 'POST' && req.url === '/api/v1/chat/completions') {
         let body = '';
         req.on('data', chunk => body += chunk);
-        req.on('end', () => {
+        req.on('end', async () => {
           lastReceivedBody = JSON.parse(body);
+          const clientPubKey = req.headers['x-venice-tee-client-pub-key'] as string;
           res.writeHead(200, { 'Content-Type': 'text/event-stream' });
           for (const chunk of responseChunks) {
-            res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: chunk }, finish_reason: null }] })}\n\n`);
+            const content = await encryptForClient(clientPubKey, chunk);
+            res.write(`data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: null }] })}\n\n`);
           }
           res.write('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n');
           res.write('data: [DONE]\n\n');

@@ -1,7 +1,47 @@
 import { createVeniceE2EE, isE2EEModel, verifyReceipt } from 'venice-e2ee';
-import type { E2EESession, VeniceE2EEOptions, ReceiptVerification } from 'venice-e2ee';
+import type {
+  E2EESession,
+  VeniceE2EEOptions,
+  ReceiptVerification,
+  ReceiptResponseHashField,
+} from 'venice-e2ee';
 import type { ProxyConfig } from './config.js';
+import { AnchorStore, readObservedAnchor, type AnchorSource } from './receipt-anchors.js';
 import { logger } from './logger.js';
+
+/**
+ * What came of a receipt check.
+ *
+ * `unavailable` and `anchor-conflict` are kept apart from a failed verification
+ * because they mean different things and deserve different noise levels: the
+ * first is a gateway that predates receipts, the second is the alarm this whole
+ * mechanism exists to raise.
+ */
+export type ReceiptOutcome =
+  | {
+      status: 'checked';
+      anchorSource: AnchorSource;
+      result: ReceiptVerification;
+      /** False when the only failures are the two body-hash checks. */
+      bodyBindingOk: boolean;
+    }
+  | { status: 'unavailable'; reason: string }
+  | { status: 'anchor-conflict'; reason: string };
+
+/**
+ * The checks that bind a receipt to specific request and response bytes.
+ *
+ * Measured against the live API, these never pass from behind `api.venice.ai`:
+ * both fail identically on the E2EE and TEE-only paths, streaming or not, which
+ * places a re-serializing hop between this proxy and the ACI gateway that issues
+ * the receipt. Venice demonstrably re-wraps responses — it adds `cost` and
+ * `venice_parameters` — and the request hashes suggest the same on the way in.
+ *
+ * They are kept and reported rather than suppressed, but a failure here means
+ * "could not be reproduced from this vantage point", not "the bytes were
+ * tampered with", and the two must not be conflated.
+ */
+const BODY_BINDING_CHECKS = new Set(['request_body_hash_matches', 'response_body_hash_matches']);
 
 /**
  * Client-facing prefix that selects TEE-only mode.
@@ -38,9 +78,11 @@ export class SessionManager {
   private instances = new Map<string, ReturnType<typeof createVeniceE2EE>>();
   private config: ProxyConfig;
   private dcapVerifier?: VeniceE2EEOptions['dcapVerifier'];
+  private anchors: AnchorStore;
 
   constructor(config: ProxyConfig) {
     this.config = config;
+    this.anchors = new AnchorStore(config.receipt_anchor_store, config.receipt_anchors ?? {});
   }
 
   /**
@@ -148,17 +190,60 @@ export class SessionManager {
    * Fetch and verify the signed receipt for a completion.
    *
    * Attestation proves an enclave exists; the receipt proves this particular
-   * completion came out of it. Costs one attestation fetch and one signature
-   * fetch, which is why callers run it after the response is already on its way
-   * rather than in the request path.
+   * completion came out of it — but only against a trust anchor, which is pinned
+   * rather than proven. See {@link AnchorStore} for why that is the best
+   * available today.
+   *
+   * Returns `unavailable` rather than throwing when the model's gateway predates
+   * ACI: `e2ee-deepseek-v4-flash` attests fine and serves E2EE traffic, but its
+   * attestation carries no `workload_id`, no keyset and no receipt to check.
+   * That is a missing capability, not a failed verification, and reporting it as
+   * a failure would be a false alarm on every request.
    */
-  async verifyReceipt(modelId: string, requestId: string): Promise<ReceiptVerification> {
+  async verifyReceipt(
+    modelId: string,
+    requestId: string,
+    bodies: { requestBody: string; responseBody: string; responseHashField: ReceiptResponseHashField }
+  ): Promise<ReceiptOutcome> {
     const instance = this.getOrCreateInstance(modelId);
-    const [attestation, signature] = await Promise.all([
-      instance.attest(modelId),
-      instance.fetchResponseSignature(modelId, requestId),
-    ]);
-    return verifyReceipt(signature, attestation, { requestId });
+    const attestation = await instance.attest(modelId);
+
+    const observed = readObservedAnchor(attestation);
+    if (!observed) {
+      return {
+        status: 'unavailable',
+        reason: 'attestation carries no ACI workload identity (pre-ACI gateway)',
+      };
+    }
+
+    const resolution = this.anchors.resolve(modelId, observed);
+    if (resolution.conflict) {
+      return {
+        status: 'anchor-conflict',
+        reason:
+          `pinned ${resolution.conflict.expected.workloadId} / ` +
+          `${resolution.conflict.expected.workloadKeysetDigest}, ` +
+          `attestation now says ${resolution.conflict.observed.workloadId} / ` +
+          `${resolution.conflict.observed.workloadKeysetDigest}`,
+      };
+    }
+
+    const signature = await instance.fetchResponseSignature(modelId, requestId);
+    const result = await verifyReceipt(signature, attestation, {
+      trustAnchor: resolution.anchor,
+      requestId,
+      requestBody: bodies.requestBody,
+      responseBody: bodies.responseBody,
+      responseHashField: bodies.responseHashField,
+    });
+
+    const failed = result.checks.filter((check) => !check.ok);
+    return {
+      status: 'checked',
+      anchorSource: resolution.source,
+      result,
+      bodyBindingOk: !failed.some((check) => BODY_BINDING_CHECKS.has(check.name)),
+    };
   }
 
   /**
