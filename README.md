@@ -210,7 +210,7 @@ Attestation gates the request on both paths: if verification fails, nothing is s
 
 ## What is actually attested
 
-**TLDR.** The Intel attestation covers a *gateway*, not the machine that runs the model. Your prompt is decrypted there and forwarded over ordinary TLS to a separate inference host, which sees it in plaintext. The GPU attestation covers a *chip*, not the software on it: NVIDIA vouches that a genuine Hopper GPU is in confidential-compute mode with known firmware, and says nothing about what code or model weights it loaded. Neither attestation covers where the gateway forwards to, because the upstream list is runtime state and is not measured. What you get is a strong guarantee about one hop and a weak one about the rest.
+**TLDR.** The Intel attestation covers a *gateway*, not the machine that runs the model. Your prompt is decrypted there and forwarded over TLS to a separate inference host, which sees it in plaintext. The gateway does attest that host before forwarding, with a real DCAP check bound to the TLS key it then uses, and records the result in a signed receipt. But the check is not enforced on Venice's route, the upstream list is runtime state that the quote does not cover, and the GPU attestation covers a *chip* rather than the software on it: NVIDIA vouches that a genuine Hopper GPU is in confidential-compute mode with known firmware, and says nothing about what code or model weights it loaded. What you get is a strong guarantee about the first hop and a transitive, unenforced one about the second.
 
 ### The chain, hop by hop
 
@@ -218,8 +218,8 @@ Attestation gates the request on both paths: if verification fails, nothing is s
 |---|---|---|
 | Your machine to gateway | ciphertext only | the ECDH key is bound into the TDX quote |
 | Gateway enclave (Intel TDX) | plaintext | the full Intel attestation above |
-| Gateway to inference host | ciphertext (TLS) | TLS SPKI recorded in the signed receipt |
-| Inference host (the GPU) | plaintext | NVIDIA attests the chip, not the software |
+| Gateway to inference host | ciphertext (TLS) | gateway verifies the node's quote and binds the TLS key |
+| Inference host (the GPU) | plaintext | attested as a TEE, but `gpu_attested: unknown` |
 
 ### What the Intel attestation actually proves
 
@@ -237,7 +237,7 @@ gateway-upstreams:
 
 with the comment that routes are "seeded into `<state_dir>/upstreams.json` only when empty, then managed at runtime via `PUT /v1/admin/upstreams`". Every upstream the gateway forwards to is installed after boot through an admin API, backed by a mutable volume. The quote fixes a gateway whose upstream list is empty. It says nothing about which machines the running gateway talks to, or what policy it applies to them.
 
-The gateway source supports per-upstream attestation policy (`accepted_workload_ids`, `accepted_image_digests`, `pccs_url`), but those are optional, and its own comment notes that plain OpenAI-compatible upstreams "have no verifier".
+Per-upstream attestation policy (`accepted_workload_ids`, `accepted_image_digests`, `pccs_url`) is configured alongside each route, so it is runtime state too. It is also optional: the source notes that plain OpenAI-compatible upstreams "have no verifier". What Venice's routes actually do is visible in the receipt, covered next.
 
 ### What the gateway to inference link looks like
 
@@ -255,9 +255,15 @@ Ordinary HTTPS, terminated at the far end. A signed receipt records which endpoi
     "model_weights_provenance": { "status": "unknown" } } }
 ```
 
-Encrypted in transit, then plaintext on arrival. The inference host reads your prompt. `result: verified` means the gateway checked the upstream and bound the channel, so this is the gateway's word rather than yours, and `required: false` means the check was not mandatory for this route.
+Encrypted in transit, then plaintext on arrival: the inference host reads your prompt, and nothing cryptographic stops it logging what it reads. What constrains it is that the gateway attests it first, and `result: verified` is not a rubber stamp. For an ACI upstream the gateway fetches `/v1/aci/attestation?nonce=` from the node with a fresh nonce, verifies the DCAP quote against Intel's roots through a PCCS, checks the TEE type and report-data binding, replays the dstack event log against RTMR3, and requires the node's attested TLS key to equal the one the connection actually used. That last step is the `tls_spki_sha256` channel binding above, and it is what stops the verification describing one machine while the prompt goes to another.
 
-The remaining claims are the honest part. Venice's own receipt reports `gpu_attested`, `serving_software_known_good` and `model_weights_provenance` as `unknown`.
+So the chain is transitive rather than absent: you attest the gateway, the gateway attests the inference node the same way you attested it, and the receipt is signed evidence of what it found. Two things bound how much that is worth.
+
+`required: false` means the check was not enforced for this route. The gateway runs the verifier either way, but the fail-closed gate that refuses to forward on a failed check is off, so a failure here would be recorded in the receipt rather than blocking your prompt. The gateway does support enforcement (`provider.aci_verified: true`, which the source gates before any upstream IO), but Venice's API rejects that field outright with `400 Unrecognized key(s) in object: 'provider'`, so a client cannot demand it through Venice today.
+
+The route is also not stable. Observed verifiers across requests to one model included `aci-service/v2` and `private-ai-verifier/chutes/v1`, so which upstream answers, and which verifier judges it, can change between requests.
+
+The remaining claims are the honest part, and they are the gateway's own assessment of what it could not establish: `gpu_attested`, `tcb_up_to_date`, `os_known_good`, `serving_software_known_good` and `model_weights_provenance` all read `unknown`. The inference node proves it is a TEE running a measured workload. It does not prove its GPU is attested, nor what weights it loaded.
 
 ### What the GPU attestation actually proves
 
