@@ -27,6 +27,21 @@ export interface ProxyConfig {
   verify_gpu_attestation: boolean;
   /** Override the NRAS endpoint (a self-hosted verifier, or an air-gapped stub). */
   nras_url?: string;
+  /**
+   * Verify the ES384 signature on NVIDIA's tokens against its published keys,
+   * rather than trusting TLS to NRAS alone. On by default whenever GPU
+   * attestation is on: it costs one cached JWKS fetch per 15 minutes, and
+   * without it a token is only as good as the connection it arrived on.
+   */
+  verify_gpu_token_signatures: boolean;
+  /** Override where NVIDIA's key set is fetched from. */
+  nras_jwks_url?: string;
+  /**
+   * SHA-256 hex digests of NVIDIA certificates that must appear in the token's
+   * chain. Supply the intermediate or root obtained out of band to stop relying
+   * on the TLS fetch. Empty means no pinning.
+   */
+  gpu_pinned_certs: string[];
   verify_receipts: boolean;
   /** Where trust-on-first-use receipt anchors are recorded. */
   receipt_anchor_store: string;
@@ -47,6 +62,8 @@ const DEFAULTS: Omit<ProxyConfig, 'venice_api_key'> = {
   verify_attestation: true,
   enable_dcap: true,
   verify_gpu_attestation: false,
+  verify_gpu_token_signatures: true,
+  gpu_pinned_certs: [],
   verify_receipts: false,
   receipt_anchor_store: '.venice-receipt-anchors.json',
   receipt_anchors: {},
@@ -93,6 +110,17 @@ export function loadConfig(configPath?: string): ProxyConfig {
       process.env.VERIFY_GPU_ATTESTATION === 'true' || process.env.VERIFY_GPU_ATTESTATION === '1';
   }
   if (process.env.NRAS_URL) envOverrides.nras_url = process.env.NRAS_URL;
+  if (process.env.NRAS_JWKS_URL) envOverrides.nras_jwks_url = process.env.NRAS_JWKS_URL;
+  if (process.env.VERIFY_GPU_TOKEN_SIGNATURES !== undefined) {
+    envOverrides.verify_gpu_token_signatures =
+      process.env.VERIFY_GPU_TOKEN_SIGNATURES !== 'false' &&
+      process.env.VERIFY_GPU_TOKEN_SIGNATURES !== '0';
+  }
+  if (process.env.GPU_PINNED_CERTS) {
+    envOverrides.gpu_pinned_certs = process.env.GPU_PINNED_CERTS.split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+  }
   if (process.env.VERIFY_RECEIPTS !== undefined) {
     envOverrides.verify_receipts =
       process.env.VERIFY_RECEIPTS === 'true' || process.env.VERIFY_RECEIPTS === '1';
@@ -135,6 +163,16 @@ export function loadConfig(configPath?: string): ProxyConfig {
       'verify_gpu_attestation requires verify_attestation. GPU evidence is checked as part of ' +
       'attestation, so it cannot be enforced while attestation is switched off.'
     );
+  }
+
+  // A malformed pin silently never matches, which reads as "pinning is on" while
+  // being equivalent to refusing every session. Catch the typo instead.
+  for (const digest of merged.gpu_pinned_certs ?? []) {
+    if (!/^[0-9a-f]{64}$/.test(digest)) {
+      throw new Error(
+        `gpu_pinned_certs entries must be SHA-256 hex digests (64 hex chars); got "${digest}"`
+      );
+    }
   }
 
   return merged;

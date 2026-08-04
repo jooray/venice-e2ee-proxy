@@ -119,7 +119,10 @@ cp .env.example .env
 | `ENABLE_DCAP` | `true` | Full DCAP quote verification |
 | `DCAP_PCCS_URL` | Phala PCCS | Where DCAP collateral is fetched from ([details](#dcap-collateral)) |
 | `VERIFY_GPU_ATTESTATION` | `false` | Check GPU evidence against NVIDIA, failing closed ([details](#gpu-attestation)) |
+| `VERIFY_GPU_TOKEN_SIGNATURES` | `true` | Verify NVIDIA's ES384 token signatures, not just TLS |
+| `GPU_PINNED_CERTS` | (none) | Comma-separated SHA-256 digests required in NVIDIA's cert chain |
 | `NRAS_URL` | NVIDIA NRAS | Override the GPU attestation verifier endpoint |
+| `NRAS_JWKS_URL` | NVIDIA JWKS | Override where NVIDIA's signing keys are fetched from |
 | `SESSION_TTL` | `1800000` | Session TTL in ms (default: 30 min) |
 | `LOG_LEVEL` | `info` | Log level: debug, info, warn, error |
 
@@ -483,11 +486,52 @@ challenge derived from your request" — not "the GPU that ran your prompt is
 attested". That is a real step up from a boolean Venice writes about itself, and
 still short of what `gpu_attested: "unknown"` in the receipt is telling you.
 
-Two further limits: the verdict is authenticated by TLS to NVIDIA rather than by
-checking the token's ES384 signature (the raw tokens are exposed on
-`session.attestation.gpu.rawTokens` for callers who want to), and each new
-session costs a round trip to NVIDIA, which learns that the evidence was checked.
-`NRAS_URL` points the check at your own verifier instead.
+Each new session costs a round trip to NVIDIA, which learns that the evidence was
+checked. `NRAS_URL` points the check at your own verifier instead.
+
+#### NVIDIA token signatures
+
+NVIDIA's verdict arrives as ES384-signed JWTs. `verify_gpu_token_signatures` is
+**on by default** whenever GPU attestation is on: the tokens are checked against
+NVIDIA's published key set rather than trusted because of the TLS connection they
+came down. It costs one cached key fetch per 15 minutes.
+
+The difference matters for what the verdict is worth. Authenticated by TLS, a
+token means something only on the call you made yourself. Signature-checked, it
+stands on its own — it can be relayed, cached, or logged and still verify, which
+is what would eventually allow Venice to pass a token through instead of the
+proxy calling NVIDIA per session.
+
+Alongside the signature, the algorithm is pinned to ES384 rather than read from
+the token, which is where the JWT confusion attacks start, `alg: none` included.
+`iss`, `exp` and `nbf` are checked. Every token is verified, overall and per-GPU,
+and any failure fails the session.
+
+NVIDIA rotates these signing certificates roughly every 48 hours — measured, not
+assumed:
+
+```
+cert[0]  CN=NVIDIA Attestation Service GPU GH100      valid 48 hours
+cert[1]  CN=NVIDIA Attestation Service GPU Intermediate 004   valid to Dec 2029
+         issued by NVIDIA Attestation Service CA 001
+```
+
+So the key set is cached briefly and refetched when a token names a `kid` that is
+not held, rate-limited so a malformed token cannot become a request flood.
+
+If you have obtained NVIDIA's intermediate or root out of band and would rather
+not rely on the TLS fetch at all, `gpu_pinned_certs` takes SHA-256 digests that
+must appear in the token's chain:
+
+```yaml
+gpu_pinned_certs:
+  - "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+```
+
+This is deliberately not full RFC 5280 path validation — a hand-rolled X.509
+validator is security-critical code that is usually subtly wrong — but the leaf
+certificate is required to carry the same key as the JWK, and a malformed digest
+is rejected at startup rather than silently never matching.
 
 To see the evidence without enabling the gate:
 

@@ -117,12 +117,33 @@ export class SessionManager {
     if (!this.config.verify_gpu_attestation) return undefined;
     if (this.gpuVerifier) return this.gpuVerifier;
 
-    const { createNvidiaVerifier } = await import('venice-e2ee/nvidia');
-    this.gpuVerifier = createNvidiaVerifier({ nrasUrl: this.config.nras_url });
+    const { createNvidiaVerifier, createNrasTokenVerifier } = await import('venice-e2ee/nvidia');
+
+    const tokenVerifier = this.config.verify_gpu_token_signatures
+      ? createNrasTokenVerifier({
+          jwksUrl: this.config.nras_jwks_url,
+          pinnedCertSha256: this.config.gpu_pinned_certs,
+        })
+      : undefined;
+
+    this.gpuVerifier = createNvidiaVerifier({ nrasUrl: this.config.nras_url, tokenVerifier });
+
     logger.info(
       `GPU attestation enabled (verifier: ${this.config.nras_url ?? 'NVIDIA NRAS'}) — ` +
       `sessions fail closed without a passing, nonce-bound NVIDIA verdict`
     );
+    if (tokenVerifier) {
+      const pins = this.config.gpu_pinned_certs.length;
+      logger.info(
+        `GPU token signatures verified against NVIDIA's key set` +
+        (pins ? ` (${pins} pinned certificate${pins === 1 ? '' : 's'})` : '')
+      );
+    } else {
+      logger.warn(
+        'GPU token signatures are NOT verified — NVIDIA\'s verdict rests on TLS to NRAS alone. ' +
+        'Set verify_gpu_token_signatures: true to check them.'
+      );
+    }
     return this.gpuVerifier;
   }
 

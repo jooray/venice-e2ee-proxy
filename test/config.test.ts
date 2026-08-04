@@ -14,6 +14,8 @@ describe('loadConfig — GPU attestation', () => {
     delete process.env.VERIFY_ATTESTATION;
     delete process.env.NRAS_URL;
     delete process.env.DCAP_PCCS_URL;
+    delete process.env.VERIFY_GPU_TOKEN_SIGNATURES;
+    delete process.env.GPU_PINNED_CERTS;
   });
 
   afterEach(() => {
@@ -52,5 +54,50 @@ describe('loadConfig — GPU attestation', () => {
   it('carries a PCCS override through', () => {
     process.env.DCAP_PCCS_URL = 'https://pccs.internal/sgx/certification/v4';
     expect(loadConfig(NO_FILE).dcap_pccs_url).toBe('https://pccs.internal/sgx/certification/v4');
+  });
+});
+
+describe('loadConfig — GPU token signatures', () => {
+  const saved = { ...process.env };
+
+  beforeEach(() => {
+    process.env.VENICE_API_KEY = 'test-key';
+    delete process.env.VERIFY_GPU_TOKEN_SIGNATURES;
+    delete process.env.GPU_PINNED_CERTS;
+    delete process.env.NRAS_JWKS_URL;
+  });
+
+  afterEach(() => {
+    process.env = { ...saved };
+  });
+
+  it('verifies token signatures by default', () => {
+    expect(loadConfig(NO_FILE).verify_gpu_token_signatures).toBe(true);
+  });
+
+  it('can be switched off explicitly', () => {
+    process.env.VERIFY_GPU_TOKEN_SIGNATURES = 'false';
+    expect(loadConfig(NO_FILE).verify_gpu_token_signatures).toBe(false);
+  });
+
+  it('pins no certificates by default', () => {
+    expect(loadConfig(NO_FILE).gpu_pinned_certs).toEqual([]);
+  });
+
+  it('parses a comma-separated pin list', () => {
+    const a = 'a'.repeat(64);
+    const b = 'b'.repeat(64);
+    process.env.GPU_PINNED_CERTS = `${a}, ${b.toUpperCase()}`;
+    expect(loadConfig(NO_FILE).gpu_pinned_certs).toEqual([a, b]);
+  });
+
+  it('rejects a malformed pin rather than never matching it', () => {
+    process.env.GPU_PINNED_CERTS = 'not-a-digest';
+    expect(() => loadConfig(NO_FILE)).toThrow(/SHA-256 hex digests/);
+  });
+
+  it('carries a JWKS override through', () => {
+    process.env.NRAS_JWKS_URL = 'https://mirror.internal/jwks.json';
+    expect(loadConfig(NO_FILE).nras_jwks_url).toBe('https://mirror.internal/jwks.json');
   });
 });

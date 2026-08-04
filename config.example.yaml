@@ -57,6 +57,23 @@ verify_gpu_attestation: false
 # Point GPU verification at your own verifier instead of NVIDIA's public NRAS.
 # nras_url: "https://your-verifier.example/v3/attest/gpu"
 
+# Verify the ES384 signature on NVIDIA's tokens against its published key set,
+# instead of trusting them because of the TLS connection they arrived on
+# (default true, and only relevant when verify_gpu_attestation is on).
+#
+# Costs one cached key fetch per 15 minutes. NVIDIA rotates these signing
+# certificates roughly every 48 hours, so the cache is deliberately short and
+# refetches when a token names a key it does not hold.
+verify_gpu_token_signatures: true
+
+# Override where NVIDIA's signing keys are fetched from.
+# nras_jwks_url: "https://nras.attestation.nvidia.com/.well-known/jwks.json"
+
+# SHA-256 digests of NVIDIA certificates that must appear in the token's chain.
+# For operators who obtained NVIDIA's intermediate or root out of band and would
+# rather not rely on the TLS fetch. Empty means no pinning.
+gpu_pinned_certs: []
+
 # Verify the signed receipt for each completion (default false).
 # Attestation proves an enclave exists; the receipt proves the enclave signed a
 # receipt for your completion id. Costs two extra round trips per request, run

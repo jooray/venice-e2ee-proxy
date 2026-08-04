@@ -17,7 +17,10 @@ const server = app.listen(config.port, config.host, () => {
   logger.info(`Attestation verification: ${config.verify_attestation ? 'enabled' : 'DISABLED'}`);
   logger.info(`DCAP verification: ${config.enable_dcap ? 'enabled' : 'disabled'}`);
   logger.info(
-    `GPU attestation: ${config.verify_gpu_attestation ? 'enabled (fails closed)' : 'disabled'}`
+    `GPU attestation: ${config.verify_gpu_attestation ? 'enabled (fails closed)' : 'disabled'}` +
+    (config.verify_gpu_attestation && config.verify_gpu_token_signatures
+      ? ', NVIDIA token signatures verified'
+      : '')
   );
   logger.info(`Session TTL: ${config.session_ttl / 1000}s`);
   logger.info('');
