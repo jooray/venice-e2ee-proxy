@@ -36,9 +36,11 @@ Each package below belongs to its own authors and is used under its own licence.
 | --- | --- | --- |
 | `venice-e2ee` (git submodule) | **GPL-3.0-only** | <https://github.com/jooray/venice-e2ee> |
 
-The submodule tracks `fix/tool-call-parsing`, a branch that carries tool-call
-parsing repairs currently open as [PR #10](https://github.com/elkimek/venice-e2ee/pull/10)
+The submodule tracks `feat/gpu-attestation`, which stacks NVIDIA GPU attestation
+on top of `fix/tool-call-parsing` — the latter carries tool-call parsing repairs
+currently open as [PR #10](https://github.com/elkimek/venice-e2ee/pull/10)
 against upstream [`elkimek/venice-e2ee`](https://github.com/elkimek/venice-e2ee).
+Neither is upstream yet, so this repo pins the fork.
 
 ### Runtime dependencies
 
