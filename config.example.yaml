@@ -33,6 +33,30 @@ verify_attestation: true
 # Requires @phala/dcap-qvl package: npm install @phala/dcap-qvl
 enable_dcap: true
 
+# Where DCAP collateral (PCK certificates, CRLs, TCB info) is fetched from.
+# Unset defaults to Phala's public PCCS at https://pccs.phala.network, which
+# also lets them observe which enclaves you verify and when, and makes your
+# verification depend on their uptime. Intel signs the collateral either way,
+# so serving it yourself changes who watches, not how strong the check is.
+# dcap_pccs_url: "https://your-pccs.example/sgx/certification/v4"
+
+# Check the GPU evidence Venice serves against NVIDIA rather than against
+# Venice's own verdict on it (default false). Requires verify_attestation.
+#
+# When true, session creation fails unless NVIDIA's Remote Attestation Service
+# vouches for the evidence AND its eat_nonce matches the nonce this session
+# sent — so the verdict is about your request, not a replayed report. Secure
+# boot, debug status and measurement results are checked per GPU. It also fails
+# when no GPU evidence is served, so the check cannot be skipped by omitting it.
+#
+# Costs one round trip to NVIDIA per session, and tells NVIDIA the evidence was
+# checked. Read the GPU attestation section of the README first: a passing check
+# does not prove the GPU is the machine that ran your prompt.
+verify_gpu_attestation: false
+
+# Point GPU verification at your own verifier instead of NVIDIA's public NRAS.
+# nras_url: "https://your-verifier.example/v3/attest/gpu"
+
 # Verify the signed receipt for each completion (default false).
 # Attestation proves an enclave exists; the receipt proves the enclave signed a
 # receipt for your completion id. Costs two extra round trips per request, run

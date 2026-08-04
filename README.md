@@ -117,6 +117,9 @@ cp .env.example .env
 | `VERIFY_RECEIPTS` | `false` | Verify the signed receipt for each completion ([details](#response-receipts)) |
 | `RECEIPT_ANCHOR_STORE` | `.venice-receipt-anchors.json` | Where trust-on-first-use receipt anchors are recorded |
 | `ENABLE_DCAP` | `true` | Full DCAP quote verification |
+| `DCAP_PCCS_URL` | Phala PCCS | Where DCAP collateral is fetched from ([details](#dcap-collateral)) |
+| `VERIFY_GPU_ATTESTATION` | `false` | Check GPU evidence against NVIDIA, failing closed ([details](#gpu-attestation)) |
+| `NRAS_URL` | NVIDIA NRAS | Override the GPU attestation verifier endpoint |
 | `SESSION_TTL` | `1800000` | Session TTL in ms (default: 30 min) |
 | `LOG_LEVEL` | `info` | Log level: debug, info, warn, error |
 
@@ -128,11 +131,25 @@ host: "127.0.0.1"
 venice_base_url: "https://api.venice.ai"
 verify_attestation: true
 enable_dcap: true
+# dcap_pccs_url: "https://your-pccs.example/sgx/certification/v4"
+verify_gpu_attestation: false
 session_ttl: 1800000
 log_level: "info"
 ```
 
 Environment variables always override config.yaml values.
+
+### DCAP collateral
+
+DCAP verification needs collateral — PCK certificates, CRLs and TCB info — and
+that has to come from a PCCS. Left unset, the library defaults to Phala's public
+PCCS at `https://pccs.phala.network`. That works, and it also means a third party
+sees which enclaves you verify and when, and that your verification fails when
+theirs does.
+
+Set `dcap_pccs_url` (or `DCAP_PCCS_URL`) to your own PCCS to remove both. The
+collateral is signed by Intel either way, so pointing elsewhere does not weaken
+the check — it only changes who serves and observes it.
 
 ### Attestation Verification
 
@@ -406,6 +423,78 @@ the ACI spec is explicit that measurement binding "does not prove that an image,
 launcher, source revision, compiler, dependency, or OS build is acceptable".
 Decide what that is worth for your threat model rather than reading "TEE" as a
 single boolean.
+
+### GPU attestation
+
+Off by default. Turn it on with `verify_gpu_attestation: true` (or
+`VERIFY_GPU_ATTESTATION=true`) and sessions fail closed unless NVIDIA vouches for
+the GPU evidence Venice served, with a nonce proving the verdict is about your
+request.
+
+```yaml
+verify_attestation: true          # required — GPU evidence is checked as part of it
+verify_gpu_attestation: true
+```
+
+Venice's attestation response carries an `nvidia_payload` alongside
+`server_verification.nvidia.valid`. That second field is Venice's own verdict on
+its own hardware; the library has always treated `nvidia.valid: false` as fatal,
+but a self-reported boolean from the party the encryption defends against only
+catches an honest node reporting its own degradation. `@axlabs/venice-e2ee-proxy`
+ships exactly that field as its `VERIFY_GPU_ATTESTATION`, and its source is
+candid about it — the flag "enforces Venice's GPU verdict" rather than checking
+NVIDIA's. It also reads it on a *separate* `/tee/attestation` fetch made before
+the handshake, so the evidence it gates on is not the evidence that produced the
+session key.
+
+This setting does the real check instead. `nvidia_payload` holds `nonce`, `arch`
+and an `evidence_list` of GPU measurements with endorsement certificates signed
+by a key NVIDIA burns into the die at manufacture. It goes verbatim to NVIDIA's
+Remote Attestation Service, which returns an ES384-signed Entity Attestation
+Token. The proxy then requires, on the same attestation that establishes the
+session:
+
+- `eat_nonce` equal to the nonce this session sent — the claim that makes the
+  verdict about your request instead of a replayed report
+- `x-nvidia-overall-att-result: true`
+- per GPU: `secboot: true`, `dbgstat: "disabled"`, `measres: "success"`
+
+Measured against the live API rather than assumed:
+
+```
+model                  evidence   GPUs   arch     NVIDIA verdict
+e2ee-gpt-oss-20b-p     12103 B    1      HOPPER   GH100, secboot ✓ dbgstat=disabled measres=success
+e2ee-glm-5-2-p         98158 B    8      HOPPER   GH100 ×8, all passing, eat_nonce bound
+```
+
+7 of the 9 E2EE models that answered a sweep carried GPU evidence; the other two
+returned 502 or 429 rather than an empty payload.
+
+**What this does not establish is co-location.** The attested CVM's `vm_config`
+reports `num_gpus: 0` and `cpu_count: 16` — the enclave holding the signing key
+has no GPU, as described above. The GPU evidence therefore comes from a different
+machine, and the only thread joining the two is the nonce, which the gateway
+handed to both. A gateway inclined to could pass that nonce to any attested
+Hopper node and return its evidence.
+
+So the honest reading of a passing check is "an attested H100 in
+confidential-compute mode, with secure boot on and debug off, answered a
+challenge derived from your request" — not "the GPU that ran your prompt is
+attested". That is a real step up from a boolean Venice writes about itself, and
+still short of what `gpu_attested: "unknown"` in the receipt is telling you.
+
+Two further limits: the verdict is authenticated by TLS to NVIDIA rather than by
+checking the token's ES384 signature (the raw tokens are exposed on
+`session.attestation.gpu.rawTokens` for callers who want to), and each new
+session costs a round trip to NVIDIA, which learns that the evidence was checked.
+`NRAS_URL` points the check at your own verifier instead.
+
+To see the evidence without enabling the gate:
+
+```bash
+python3 scripts/audit-gpu-evidence.py            # is there GPU evidence?
+python3 scripts/audit-gpu-evidence.py --nras     # verify it with NVIDIA
+```
 
 ### Function Calling
 
@@ -824,6 +913,28 @@ npm start
 
 The proxy binds to `127.0.0.1` by default and should not be exposed to the public internet. It is designed to run locally alongside your application.
 
+## Related projects
+
+[`@axlabs/venice-e2ee-proxy`](https://github.com/AxLabs/venice-e2ee-proxy) is an
+independent proxy over the same Venice protocol, and it is the more packaged of
+the two: `npx`-installable, NestJS with a Swagger UI, validated CLI flags, and a
+`DCAP_PCCS_URL` setting so DCAP collateral can be fetched from somewhere other
+than Phala's PCCS. Its [`NOTICE.md`](https://github.com/AxLabs/venice-e2ee-proxy/blob/main/NOTICE.md)
+is a good treatment of the GPL question that applies to any proxy bundling this
+library.
+
+Two differences to know before picking one. It binds to `0.0.0.0` by default
+while holding your Venice API key, where this one binds to `127.0.0.1`. And it
+forked the encryption library at a commit predating function calling over E2EE,
+so tool calls — what Cline, Roo Code and Continue lean on hardest — take a
+different path there than the one documented above. Its
+`VERIFY_GPU_ATTESTATION` flag is covered under
+[GPU attestation](#gpu-attestation).
+
 ## License
 
-MIT
+GPL-3.0-only. See [`LICENSE`](LICENSE), and [`NOTICE.md`](NOTICE.md) for why:
+the proxy vendors the GPL-3.0 `venice-e2ee` library as a submodule and links it
+at runtime, so any distributed build is a combined work under the GPL. Running
+the proxy yourself, including as a service reachable over the network, carries no
+distribution obligation — this is the GPL, not the AGPL.

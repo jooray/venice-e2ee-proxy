@@ -29,6 +29,7 @@ export function createServer(config: ProxyConfig) {
       version: '1.0.0',
       verify_attestation: config.verify_attestation,
       enable_dcap: config.enable_dcap,
+      verify_gpu_attestation: config.verify_gpu_attestation,
     });
   });
 

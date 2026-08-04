@@ -9,6 +9,24 @@ export interface ProxyConfig {
   venice_base_url: string;
   verify_attestation: boolean;
   enable_dcap: boolean;
+  /**
+   * PCCS server used to fetch DCAP collateral (PCK certs, CRLs, TCB info).
+   * Unset means the library's default, Phala's public PCCS — which is a third
+   * party watching which enclaves you verify, and a single point of failure for
+   * verification. Point it at your own PCCS to avoid both.
+   */
+  dcap_pccs_url?: string;
+  /**
+   * Check the GPU evidence Venice serves against NVIDIA rather than against
+   * Venice's own verdict on it. Off by default: it costs an NRAS round trip per
+   * session and tells NVIDIA the evidence was checked.
+   *
+   * When on, it fails closed — including when no GPU evidence is served at all.
+   * A GPU check that only logs is the check Venice already self-reports.
+   */
+  verify_gpu_attestation: boolean;
+  /** Override the NRAS endpoint (a self-hosted verifier, or an air-gapped stub). */
+  nras_url?: string;
   verify_receipts: boolean;
   /** Where trust-on-first-use receipt anchors are recorded. */
   receipt_anchor_store: string;
@@ -28,6 +46,7 @@ const DEFAULTS: Omit<ProxyConfig, 'venice_api_key'> = {
   venice_base_url: 'https://api.venice.ai',
   verify_attestation: true,
   enable_dcap: true,
+  verify_gpu_attestation: false,
   verify_receipts: false,
   receipt_anchor_store: '.venice-receipt-anchors.json',
   receipt_anchors: {},
@@ -68,6 +87,12 @@ export function loadConfig(configPath?: string): ProxyConfig {
   if (process.env.ENABLE_DCAP !== undefined) {
     envOverrides.enable_dcap = process.env.ENABLE_DCAP === 'true' || process.env.ENABLE_DCAP === '1';
   }
+  if (process.env.DCAP_PCCS_URL) envOverrides.dcap_pccs_url = process.env.DCAP_PCCS_URL;
+  if (process.env.VERIFY_GPU_ATTESTATION !== undefined) {
+    envOverrides.verify_gpu_attestation =
+      process.env.VERIFY_GPU_ATTESTATION === 'true' || process.env.VERIFY_GPU_ATTESTATION === '1';
+  }
+  if (process.env.NRAS_URL) envOverrides.nras_url = process.env.NRAS_URL;
   if (process.env.VERIFY_RECEIPTS !== undefined) {
     envOverrides.verify_receipts =
       process.env.VERIFY_RECEIPTS === 'true' || process.env.VERIFY_RECEIPTS === '1';
@@ -96,10 +121,21 @@ export function loadConfig(configPath?: string): ProxyConfig {
     );
   }
 
-  return {
+  const merged = {
     ...DEFAULTS,
     ...fileConfig,
     ...envOverrides,
     venice_api_key: apiKey,
   } as ProxyConfig;
+
+  // Caught here rather than at the first request, where the library would throw
+  // the same objection with far less context about which setting caused it.
+  if (merged.verify_gpu_attestation && !merged.verify_attestation) {
+    throw new Error(
+      'verify_gpu_attestation requires verify_attestation. GPU evidence is checked as part of ' +
+      'attestation, so it cannot be enforced while attestation is switched off.'
+    );
+  }
+
+  return merged;
 }

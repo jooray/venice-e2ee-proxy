@@ -16,6 +16,9 @@ const server = app.listen(config.port, config.host, () => {
   logger.info(`Venice API: ${config.venice_base_url}`);
   logger.info(`Attestation verification: ${config.verify_attestation ? 'enabled' : 'DISABLED'}`);
   logger.info(`DCAP verification: ${config.enable_dcap ? 'enabled' : 'disabled'}`);
+  logger.info(
+    `GPU attestation: ${config.verify_gpu_attestation ? 'enabled (fails closed)' : 'disabled'}`
+  );
   logger.info(`Session TTL: ${config.session_ttl / 1000}s`);
   logger.info('');
   logger.info('Usage:');

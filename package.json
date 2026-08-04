@@ -31,7 +31,7 @@
     "type": "git",
     "url": "git+https://github.com/jooray/venice-e2ee-proxy.git"
   },
-  "license": "MIT",
+  "license": "GPL-3.0-only",
   "keywords": [
     "venice",
     "e2ee",

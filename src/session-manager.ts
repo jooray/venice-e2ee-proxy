@@ -78,6 +78,7 @@ export class SessionManager {
   private instances = new Map<string, ReturnType<typeof createVeniceE2EE>>();
   private config: ProxyConfig;
   private dcapVerifier?: VeniceE2EEOptions['dcapVerifier'];
+  private gpuVerifier?: VeniceE2EEOptions['gpuVerifier'];
   private anchors: AnchorStore;
 
   constructor(config: ProxyConfig) {
@@ -94,13 +95,35 @@ export class SessionManager {
 
     try {
       const { createDcapVerifier } = await import('venice-e2ee/dcap');
-      this.dcapVerifier = createDcapVerifier();
-      logger.info('DCAP verifier initialized');
+      this.dcapVerifier = createDcapVerifier(this.config.dcap_pccs_url);
+      logger.info(
+        `DCAP verifier initialized (collateral: ${this.config.dcap_pccs_url ?? 'Phala PCCS default'})`
+      );
       return this.dcapVerifier;
     } catch (e) {
       logger.warn('Failed to initialize DCAP verifier. Install @phala/dcap-qvl for full DCAP support.', e);
       return undefined;
     }
+  }
+
+  /**
+   * Lazily initialize the GPU verifier if enabled.
+   *
+   * Unlike DCAP, a failure to construct this one is fatal rather than a warning:
+   * the setting exists to fail closed, so silently continuing without it would
+   * turn a hard guarantee into a log line nobody reads.
+   */
+  private async getGpuVerifier(): Promise<VeniceE2EEOptions['gpuVerifier']> {
+    if (!this.config.verify_gpu_attestation) return undefined;
+    if (this.gpuVerifier) return this.gpuVerifier;
+
+    const { createNvidiaVerifier } = await import('venice-e2ee/nvidia');
+    this.gpuVerifier = createNvidiaVerifier({ nrasUrl: this.config.nras_url });
+    logger.info(
+      `GPU attestation enabled (verifier: ${this.config.nras_url ?? 'NVIDIA NRAS'}) — ` +
+      `sessions fail closed without a passing, nonce-bound NVIDIA verdict`
+    );
+    return this.gpuVerifier;
   }
 
   /**
@@ -116,6 +139,8 @@ export class SessionManager {
         sessionTTL: this.config.session_ttl,
         verifyAttestation: this.config.verify_attestation,
         dcapVerifier: this.dcapVerifier,
+        gpuVerifier: this.gpuVerifier,
+        requireGpu: this.config.verify_gpu_attestation,
       });
       this.instances.set(modelId, instance);
       logger.debug(`Created E2EE instance for model: ${modelId}`);
@@ -132,9 +157,13 @@ export class SessionManager {
     session: E2EESession;
     instance: ReturnType<typeof createVeniceE2EE>;
   }> {
-    // Ensure DCAP verifier is loaded before creating instances
+    // Ensure verifiers are loaded before creating instances — an instance built
+    // without them would cache a session that skipped the checks.
     if (this.config.enable_dcap && !this.dcapVerifier) {
       await this.getDcapVerifier();
+    }
+    if (this.config.verify_gpu_attestation && !this.gpuVerifier) {
+      await this.getGpuVerifier();
     }
 
     const instance = this.getOrCreateInstance(modelId);
