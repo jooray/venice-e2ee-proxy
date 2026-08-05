@@ -1,4 +1,4 @@
-import { createVeniceE2EE, isE2EEModel, verifyReceipt } from 'venice-e2ee';
+import { BODY_BINDING_CHECKS, createVeniceE2EE, isE2EEModel, verifyReceipt } from 'venice-e2ee';
 import type {
   E2EESession,
   VeniceE2EEOptions,
@@ -75,21 +75,6 @@ export function readUpstreamVerification(signature: unknown): UpstreamVerificati
       .map(([name]) => name),
   };
 }
-
-/**
- * The checks that bind a receipt to specific request and response bytes.
- *
- * Measured against the live API, these never pass from behind `api.venice.ai`:
- * both fail identically on the E2EE and TEE-only paths, streaming or not, which
- * places a re-serializing hop between this proxy and the ACI gateway that issues
- * the receipt. Venice demonstrably re-wraps responses — it adds `cost` and
- * `venice_parameters` — and the request hashes suggest the same on the way in.
- *
- * They are kept and reported rather than suppressed, but a failure here means
- * "could not be reproduced from this vantage point", not "the bytes were
- * tampered with", and the two must not be conflated.
- */
-const BODY_BINDING_CHECKS = new Set(['request_body_hash_matches', 'response_body_hash_matches']);
 
 /**
  * Client-facing prefix that selects TEE-only mode.
@@ -170,7 +155,7 @@ export class SessionManager {
     const tokenVerifier = this.config.verify_gpu_token_signatures
       ? createNrasTokenVerifier({
           jwksUrl: this.config.nras_jwks_url,
-          pinnedCertSha256: this.config.gpu_pinned_certs,
+          pinnedLeafCertSha256: this.config.gpu_pinned_certs,
         })
       : undefined;
 
@@ -336,11 +321,17 @@ export class SessionManager {
     });
 
     const failed = result.checks.filter((check) => !check.ok);
+    // Measured against the live API, the body-binding checks never pass from
+    // behind `api.venice.ai`: both fail identically on the E2EE and TEE-only
+    // paths, streaming or not, which places a re-serializing hop between this
+    // proxy and the ACI gateway that issues the receipt. A failure here means
+    // "could not be reproduced from this vantage point", not "the bytes were
+    // tampered with", and the two must not be conflated.
     return {
       status: 'checked',
       anchorSource: resolution.source,
       result,
-      bodyBindingOk: !failed.some((check) => BODY_BINDING_CHECKS.has(check.name)),
+      bodyBindingOk: !failed.some((check) => BODY_BINDING_CHECKS.includes(check.name)),
       upstream: readUpstreamVerification(signature),
     };
   }

@@ -330,9 +330,11 @@ Venice serves an `nvidia_payload` alongside `server_verification.nvidia.valid`. 
 
 This setting does the real check. `nvidia_payload` holds `nonce`, `arch` and an `evidence_list` of GPU measurements with endorsement certificates signed by a key NVIDIA burns into the die at manufacture. It goes verbatim to NVIDIA's Remote Attestation Service, which returns an ES384-signed Entity Attestation Token. The proxy then requires, on the same attestation that establishes the session:
 
-- `eat_nonce` equal to the nonce this session sent, the claim that makes the verdict about your request instead of a replayed report
+- `eat_nonce` equal to the nonce this session sent, in the overall token and in every per-GPU token — the claim that makes the verdict about your request instead of a replayed report
 - `x-nvidia-overall-att-result: true`
-- per GPU: `secboot: true`, `dbgstat: "disabled"`, `measres: "success"`
+- per GPU: `secboot: true`, `dbgstat: "disabled"`, `measres: "success"`, and a matching report nonce
+
+A claim that is missing or arrives with the wrong type fails the session rather than being read as the safe value.
 
 Measured against the live API:
 
@@ -359,9 +361,9 @@ NVIDIA's verdict arrives as ES384-signed JWTs. `verify_gpu_token_signatures` is 
 
 The difference matters for what the verdict is worth. Authenticated by TLS, a token means something only on the call you made yourself. Signature checked, it stands on its own, so it can be relayed, cached or logged and still verify. That is what would eventually let Venice pass a token through instead of the proxy calling NVIDIA per session.
 
-The algorithm is pinned to ES384 rather than read from the token, which is where the JWT confusion attacks start, `alg: none` included. `iss`, `exp` and `nbf` are checked, every token is verified, and any failure fails the session.
+The algorithm is pinned to ES384 rather than read from the token, which is where the JWT confusion attacks start, `alg: none` included. `iss` and a finite `exp` are required, `nbf` is checked when the token carries one, every token is verified, and any failure fails the session.
 
-The signing certificate's own validity window is enforced per token, and that is what bounds a withdrawn key. Measured rather than assumed:
+Where the signing key ships a certificate chain, that certificate's own validity window is enforced per token as a further bound on a withdrawn key. Measured rather than assumed:
 
 ```
 cert[0]  CN=NVIDIA Attestation Service GPU GH100             valid 48 hours
@@ -369,16 +371,16 @@ cert[1]  CN=NVIDIA Attestation Service GPU Intermediate 004  valid to Dec 2029
          issued by NVIDIA Attestation Service CA 001
 ```
 
-Because a withdrawn key stops working on NVIDIA's own 48 hour schedule, the key set does not need frequent polling. It is cached for 12 hours and refetched whenever a token names a `kid` not held, rate limited so a malformed token or a failing NVIDIA cannot become a request flood.
+A withdrawn key is caught by the cache refresh, and NVIDIA's 48 hour leaf window bounds it further, so the key set does not need frequent polling. It is cached for 12 hours and refetched whenever a token names a `kid` not held, rate limited so a malformed token or a failing NVIDIA cannot become a request flood.
 
-If you have obtained NVIDIA's intermediate or root out of band and would rather not rely on the TLS fetch, `gpu_pinned_certs` takes SHA-256 digests that must appear in the token's chain:
+If you have obtained a signing leaf certificate out of band and would rather not rely on the TLS fetch, `gpu_pinned_certs` takes SHA-256 digests that the token's leaf must match exactly:
 
 ```yaml
 gpu_pinned_certs:
   - "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 ```
 
-This is deliberately not full RFC 5280 path validation, since a hand-rolled X.509 validator is security-critical code that is usually subtly wrong. The leaf certificate is required to carry the same key as the JWK, and a malformed digest is rejected at startup rather than silently never matching.
+Only the leaf counts. Pinning an intermediate or root would not help, because the chain in the token is not path validated — appending a pinned certificate to it is something anyone can do. This is deliberately not full RFC 5280 path validation, since a hand-rolled X.509 validator is security-critical code that is usually subtly wrong. The leaf certificate is required to carry the same key as the JWK, and a malformed digest is rejected at startup rather than silently never matching.
 
 ## Response receipts
 

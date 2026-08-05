@@ -34,13 +34,11 @@ Each package below belongs to its own authors and is used under its own licence.
 
 | Component | Licence | Source |
 | --- | --- | --- |
-| `venice-e2ee` (git submodule) | **GPL-3.0-only** | <https://github.com/jooray/venice-e2ee> |
+| `venice-e2ee` (git submodule) | **GPL-3.0-only** | <https://github.com/elkimek/venice-e2ee> |
 
-The submodule tracks `feat/gpu-attestation`, which stacks NVIDIA GPU attestation
-on top of `fix/tool-call-parsing` — the latter carries tool-call parsing repairs
-currently open as [PR #10](https://github.com/elkimek/venice-e2ee/pull/10)
-against upstream [`elkimek/venice-e2ee`](https://github.com/elkimek/venice-e2ee).
-Neither is upstream yet, so this repo pins the fork.
+The submodule tracks upstream `main`, pinned at `v0.4.1`. The tool-call parsing
+repairs and the NVIDIA GPU attestation work this proxy relies on were carried on
+a fork until upstream merged them; nothing is pinned outside upstream now.
 
 ### Runtime dependencies
 

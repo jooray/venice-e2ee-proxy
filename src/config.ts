@@ -41,9 +41,10 @@ export interface ProxyConfig {
   /** Override where NVIDIA's key set is fetched from. */
   nras_jwks_url?: string;
   /**
-   * SHA-256 hex digests of NVIDIA certificates that must appear in the token's
-   * chain. Supply the intermediate or root obtained out of band to stop relying
-   * on the TLS fetch. Empty means no pinning.
+   * SHA-256 hex digests the token's signing leaf certificate must match exactly.
+   * Supply a leaf obtained out of band to stop relying on the TLS fetch. Pinning
+   * an intermediate or root does nothing, since the chain carried in the token
+   * is not path validated. Empty means no pinning.
    */
   gpu_pinned_certs: string[];
   verify_receipts: boolean;
