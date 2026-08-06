@@ -90,10 +90,19 @@ need signing, because the ids are hashes and the hash sits inside a signed
 receipt. The recommendation to "sign `/v1/aci/sessions`" asks for something
 weaker than what exists.
 
-What survives of the concern is narrower and still true: `required: false` on
-Venice's route (B2 is exactly right about why), and `evidence_digest` commits to
-evidence the public store does not serve, so a relying party can verify the
-commitment but not re-derive the evidence behind it.
+And the evidence is served. Fetched by id rather than from the list, a session
+carries the upstream's complete ACI report inline as a `data:` URI — quote
+included. So the second hop is not merely committed to, it is checkable: its TDX
+quote DCAP-verifies against Intel's roots from here, and the TLS key the gateway
+bound the channel to appears in that upstream's own attested keyset for the host
+it dialled. Both now run in the proxy (§4).
+
+What survives of the concern is narrower than the audit had it, and comes to two
+things. `required: false` on Venice's route, so the check is recorded rather than
+enforced — B2 is exactly right about why. And freshness: the gateway does not
+publish the nonce it sent when it fetched that report, so the statement binding
+cannot be recomputed and a captured report cannot be told from a current one.
+Everything else in the chain is verifiable from a client's own machine.
 
 ### Claims the audit missed
 
@@ -113,6 +122,9 @@ commitment but not re-derive the evidence behind it.
 - **The gateway's session store is world-readable** on all three hostnames — 346
   sessions with endpoints, claims and bindings. It is what makes the verification
   above possible, and it is also an enumeration surface nobody asked for.
+- **The session store serves the evidence, not just its digest.** The by-id
+  endpoint returns the upstream's full ACI report inline, which is what makes
+  independent verification of the second hop possible at all.
 - The claim that the OS image "cannot be inspected" is contradicted by
   `phala_direct.py`, which re-downloads the published image and verifies the
   hash-to-`is_dev` binding.
@@ -473,7 +485,9 @@ especially `provider.aci_verified` passthrough and enforced verification on
 Venice's own domain — if you want the gap to shrink.
 
 **Amended after the verification pass.** The above stands, with one correction
-that changes the shape of the conclusion rather than its severity. This audit
+that changes the shape of the conclusion rather than its severity, and with the
+"second attested router" no longer taken on faith: its quote is verified from
+here (§4). This audit
 judged the client-side chain to bottom out in trust-on-first-use and in formats
 nobody had reconstructed, and recommended asking three parties to fix it. That
 was wrong: the binding already existed, in a published protocol, on a public
@@ -484,10 +498,11 @@ machine it forwarded to is cryptographic end to end and now verified in code
 
 What remains genuinely unproven is smaller and sharper than "the anchor is
 pinned". It is: `required: false` on Venice's route, so the upstream check is
-recorded rather than enforced; `evidence_digest` committing to evidence the
-public store will not serve; body hashes that cannot be reproduced through
-Venice's re-serialising hop; and the unmeasured build, unmeasured secrets and
-unattested serving software described in §2.4. Those are the things to push on.
+recorded rather than enforced; the unpublished nonce behind the upstream report,
+which leaves that hop's freshness resting on the attested gateway; body hashes
+that cannot be reproduced through Venice's re-serialising hop; and the unmeasured
+build, unmeasured secrets and unattested serving software of §2.4. Those are the
+things to push on.
 
 ---
 
@@ -522,6 +537,31 @@ pin this repo recorded on 2026-08-04, which is the corroboration TOFU could neve
 give itself. A deliberately unreachable endpoint produced the refusal rather than
 a silent downgrade, and wrote no pin.
 
+### Verifying the second hop (`20fbd08`, library `7bb004c`)
+
+- **`verifyAttestedSession()` / `fetchAttestedSession()` / `computeAttestedSessionId()`**
+  recompute the content-addressed session id, check the evidence digest, and
+  verify the upstream's own report — DCAP against Intel's roots, digest and
+  workload-id recomputation, endorsement, debug bit — folding its checks in under
+  an `upstream.` prefix.
+- **`channel_binding_in_attested_keyset`** is what makes the rest mean something:
+  the TLS SPKI the gateway bound must appear in the upstream's *attested* keyset
+  for the host dialled. Without it a genuine report for another machine passes.
+- **`verifyRelayedAciAttestation()` and `nonceBound`** keep the freshness gap
+  visible. The check is skipped rather than faked, no anchor is derived from a
+  relayed report, and the proxy prints the limitation on every line.
+- The proxy runs this only after the receipt carrying the session id verifies,
+  for the same reason the upstream verdict is now reported late.
+
+Live on both paths:
+
+```
+Upstream session as_e8677297… verified here for e2ee-glm-5-2-p: the second hop's
+own quote checks out (TCB UpToDate, source 70513c1cc22c2259dc95c598d8b43b9d20aecbbf)
+and the channel the gateway bound is a TLS key it attested.
+```
+
 Still open from §3: P2 (error-body logging), P5/P6 (TTL clamping and
-`keyset_epoch` surfacing), and verifying the `session_id` commitment against the
-gateway's session store, which would carry the transitive check one hop further.
+`keyset_epoch` surfacing), and — not fixable client-side — the unpublished nonce
+behind the upstream report, `required: false` on Venice's route, and the
+unmeasured build and serving software of §2.4.
