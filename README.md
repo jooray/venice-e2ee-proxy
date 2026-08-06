@@ -82,6 +82,7 @@ cp .env.example .env
 | `VERIFY_RECEIPTS` | `false` | Verify the receipt for each completion ([details](#response-receipts)) |
 | `RECEIPT_ANCHOR_STORE` | `.venice-receipt-anchors.json` | Where receipt anchors are recorded |
 | `ACI_ATTESTATION_URL` | `https://tee.redpill.ai` | Gateway origin whose quote proves the receipt anchor; `""` pins on first use |
+| `VERIFY_UPSTREAM_SESSIONS` | `true` | Recheck the gateway's verdict on its upstream by verifying that hop's own quote |
 | `SESSION_TTL` | `1800000` | Session TTL in ms |
 | `LOG_LEVEL` | `info` | debug, info, warn, error |
 
@@ -444,6 +445,29 @@ receipt_anchors:
 ```
 
 The store is read once at startup, so edits need a restart.
+
+### Checking the second hop rather than believing it
+
+The receipt's `upstream.verified` event records what the gateway found when it checked the machine it forwarded your prompt to. The receipt signature covers that claim — but a claim is all it is, until you look at what it rests on.
+
+The event names an attested session, and the id is content-addressed over the material the gateway verified, including a digest of the upstream's own attestation report. So the id inside a signed receipt is a commitment to the whole record. Fetched by id, the session carries that report inline: quote and all.
+
+With `verify_upstream_sessions` on, the proxy fetches it, recomputes the session id, checks the evidence digest, DCAP-verifies the *second hop's* quote against Intel's roots, and requires the TLS key the gateway bound the channel to appear in that upstream's attested keyset for the host it dialled. Without that last check, a genuine report describing some other machine would pass.
+
+```
+INFO  Upstream session as_e8677297… verified here for e2ee-glm-5-2-p: the second hop's
+      own quote checks out (TCB UpToDate, source 70513c1c…) and the channel the gateway
+      bound is a TLS key it attested. Not established: gpu_attested, tcb_up_to_date,
+      os_known_good, serving_software_known_good, model_weights_provenance. Freshness
+      is not: the nonce behind that report is not published, so this cannot tell a
+      current report from a captured one.
+```
+
+That last sentence is printed every time rather than buried here. The gateway chooses its own nonce when it fetches the upstream report and does not publish it, so the statement binding cannot be recomputed and a captured report cannot be told from a current one. Everything else in the chain is checkable from your machine; this one thing rests on the attested gateway having behaved, bounded by the session's retention window.
+
+This runs only after the receipt carrying the session id has been verified. An unverified receipt's event log is text a server sent you, and following network references out of it would be treating it as evidence. Results are cached per attested channel, since one channel serves many completions.
+
+Sessions expire with the receipts that cite them, so a check on an old completion reports the session as unavailable rather than failed — that is expiry, not missing evidence.
 
 ### The body binding cannot be checked from here
 

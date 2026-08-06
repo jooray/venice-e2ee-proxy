@@ -1,6 +1,11 @@
 import type { Request, Response } from 'express';
 import type { ProxyConfig } from './config.js';
-import { SessionManager, stripTeePrefix, type UpstreamVerification } from './session-manager.js';
+import {
+  SessionManager,
+  stripTeePrefix,
+  type UpstreamVerification,
+  type UpstreamSessionOutcome,
+} from './session-manager.js';
 import { logger } from './logger.js';
 import { debugDump } from './debug-dump.js';
 import {
@@ -41,6 +46,9 @@ function isRetriableSessionFailure(message: string): boolean {
 
 /** Models whose upstream posture has been described once already. */
 const reportedUpstreamModels = new Set<string>();
+
+/** Attested sessions already reported, so one channel is described once. */
+const reportedUpstreamSessions = new Set<string>();
 
 /**
  * Report what the gateway found when it checked the machine it forwarded to.
@@ -337,7 +345,7 @@ export class ProxyHandler {
         responseBody,
         responseHashField: 'wire_hash',
       })
-      .then((outcome) => {
+      .then(async (outcome) => {
         if (outcome.status === 'unavailable') {
           // Not a failure: this gateway predates receipts. Said once per model,
           // at info, so it does not read as an alarm on every completion.
@@ -414,6 +422,9 @@ export class ProxyHandler {
         // signature would present attacker-supplied text as a verified finding.
         if (authentic) {
           reportUpstreamVerification(upstreamModel, requestId, outcome.upstream);
+          if (this.config.verify_upstream_sessions && outcome.upstream) {
+            await this.reportUpstreamSession(upstreamModel, requestId, outcome.upstream);
+          }
         } else {
           logger.warn(
             `Not reporting the upstream verdict for ${requestId} (${upstreamModel}): the receipt ` +
@@ -433,6 +444,75 @@ export class ProxyHandler {
           `Receipt check failed for ${requestId}: ${err instanceof Error ? err.message : String(err)}`
         );
       });
+  }
+
+  /**
+   * Recheck the gateway's verdict against the evidence behind it, and say what
+   * came back.
+   *
+   * `reportUpstreamVerification` above repeats what the gateway asserted. This
+   * fetches the attested session the receipt committed to and verifies the
+   * upstream's own TDX quote here, which is a different and stronger statement:
+   * not "the gateway says it checked", but "the second hop's quote checks out
+   * against Intel's roots from this machine".
+   *
+   * A failure is logged on every completion — it means the evidence behind your
+   * prompt's second hop does not hold up. Success is said once per attested
+   * channel, since one channel serves many completions.
+   */
+  private async reportUpstreamSession(
+    modelId: string,
+    requestId: string,
+    upstream: UpstreamVerification
+  ): Promise<void> {
+    let outcome: UpstreamSessionOutcome;
+    try {
+      outcome = await this.sessionManager.verifyUpstreamSession(upstream);
+    } catch (err: unknown) {
+      logger.warn(
+        `Upstream session check failed for ${requestId} (${modelId}): ` +
+        `${err instanceof Error ? err.message : String(err)}`
+      );
+      return;
+    }
+
+    const sessionId = upstream.sessionId ?? 'unnamed';
+
+    if (outcome.status === 'failed') {
+      logger.error(
+        `Upstream session ${sessionId} for ${requestId} (${modelId}) did NOT verify: ` +
+        `${outcome.failures.join('; ')}. The gateway's verdict on the machine it forwarded ` +
+        `your prompt to is not supported by the evidence it committed to.`
+      );
+      return;
+    }
+
+    if (outcome.status === 'unavailable') {
+      if (reportedUpstreamSessions.has(sessionId)) return;
+      reportedUpstreamSessions.add(sessionId);
+      logger.info(
+        `Upstream session ${sessionId} could not be rechecked: ${outcome.reason ?? 'no reason given'}. ` +
+        `The gateway's own verdict stands unexamined.`
+      );
+      return;
+    }
+
+    if (reportedUpstreamSessions.has(sessionId)) return;
+    reportedUpstreamSessions.add(sessionId);
+
+    const unknown = outcome.unknownClaims.length
+      ? ` Not established: ${outcome.unknownClaims.join(', ')}.`
+      : '';
+    logger.info(
+      `Upstream session ${sessionId} verified here for ${modelId}: the second hop's own quote ` +
+      `checks out (TCB ${outcome.upstreamTcb ?? 'unreported'}` +
+      `${outcome.upstreamCommit ? `, source ${outcome.upstreamCommit}` : ''}) and the channel the ` +
+      `gateway bound is a TLS key it attested.` + unknown +
+      // Stated every time rather than buried: everything above is checkable, this
+      // one thing is not, and a reader should not have to infer that.
+      ` Freshness is not: the nonce behind that report is not published, so this ` +
+      `cannot tell a current report from a captured one.`
+    );
   }
 
   /**

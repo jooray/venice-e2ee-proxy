@@ -2,7 +2,9 @@ import {
   BODY_BINDING_CHECKS,
   createVeniceE2EE,
   establishAciTrustAnchor,
+  fetchAttestedSession,
   isE2EEModel,
+  verifyAttestedSession,
   verifyReceipt,
 } from 'venice-e2ee';
 import type {
@@ -64,7 +66,31 @@ export interface UpstreamVerification {
   origin?: string;
   verifierId?: string;
   reason?: string;
+  /**
+   * The attested session backing this verdict. Content-addressed over the
+   * evidence the gateway verified, so it can be fetched and rechecked rather
+   * than believed.
+   */
+  sessionId?: string;
   /** Claims the gateway could not establish, such as `gpu_attested`. */
+  unknownClaims: string[];
+}
+
+/**
+ * What came of rechecking the gateway's verdict against the session behind it.
+ *
+ * `verified` means this proxy verified the upstream's own TDX quote — not that
+ * the gateway said it did. `nonceBound` stays false regardless: the nonce behind
+ * the upstream report is not published, so a captured report cannot be told from
+ * a current one, and pretending otherwise would overstate what was checked.
+ */
+export interface UpstreamSessionOutcome {
+  status: 'verified' | 'failed' | 'unavailable';
+  reason?: string;
+  failures: string[];
+  nonceBound: boolean;
+  upstreamTcb?: string;
+  upstreamCommit?: string;
   unknownClaims: string[];
 }
 
@@ -88,6 +114,7 @@ export function readUpstreamVerification(signature: unknown): UpstreamVerificati
     origin: str(event.url_origin),
     verifierId: str(event.verifier_id),
     reason: str(event.reason),
+    sessionId: str(event.session_id),
     unknownClaims: Object.entries(claims)
       .filter(([, value]) => value?.status === 'unknown')
       .map(([name]) => name),
@@ -148,6 +175,8 @@ export class SessionManager {
   /** Cached outcome of proving an anchor from the gateway's own quote. */
   private provenAnchor: (ProvenAnchor & { expiresAt: number }) | null = null;
   private provenAnchorPending: Promise<ProvenAnchor> | null = null;
+  /** Verified upstream sessions, keyed by the content-addressed session id. */
+  private upstreamSessions = new Map<string, { outcome: UpstreamSessionOutcome; expiresAt: number }>();
 
   constructor(config: ProxyConfig) {
     this.config = config;
@@ -353,6 +382,101 @@ export class SessionManager {
       });
 
     return this.provenAnchorPending;
+  }
+
+  /**
+   * Recheck the gateway's verdict on its upstream against the evidence behind it.
+   *
+   * The receipt's `upstream.verified` event names an attested session whose id is
+   * content-addressed over the material the gateway verified — the channel
+   * binding, the claims, and a digest of the upstream's own attestation report.
+   * Fetching that session by id yields the report inline, so the second hop's
+   * quote is verified here rather than taken on the gateway's word.
+   *
+   * Called only after the receipt carrying the session id has been
+   * authenticated. An unverified receipt's event log is attacker-supplied text,
+   * and chasing network references out of it would be reading it as evidence.
+   *
+   * Cached per session id: one attested channel serves many completions, and
+   * re-running DCAP for each of them would buy nothing.
+   */
+  async verifyUpstreamSession(upstream: UpstreamVerification): Promise<UpstreamSessionOutcome> {
+    const url = this.config.aci_attestation_url?.trim();
+    const sessionId = upstream.sessionId;
+    if (!url || !sessionId) {
+      return {
+        status: 'unavailable',
+        reason: sessionId ? 'no ACI endpoint configured' : 'receipt named no attested session',
+        failures: [],
+        nonceBound: false,
+        unknownClaims: upstream.unknownClaims,
+      };
+    }
+
+    const cached = this.upstreamSessions.get(sessionId);
+    if (cached && Date.now() < cached.expiresAt) return cached.outcome;
+
+    const outcome = await this.checkUpstreamSession(url, sessionId, upstream);
+    this.upstreamSessions.set(sessionId, {
+      outcome,
+      expiresAt:
+        Date.now() +
+        (outcome.status === 'verified'
+          ? this.config.session_ttl
+          : SessionManager.ANCHOR_FAILURE_TTL_MS),
+    });
+    return outcome;
+  }
+
+  private async checkUpstreamSession(
+    url: string,
+    sessionId: string,
+    upstream: UpstreamVerification
+  ): Promise<UpstreamSessionOutcome> {
+    const base: Pick<UpstreamSessionOutcome, 'failures' | 'nonceBound' | 'unknownClaims'> = {
+      failures: [],
+      nonceBound: false,
+      unknownClaims: upstream.unknownClaims,
+    };
+
+    const dcapVerifier = await this.getDcapVerifier();
+    if (!dcapVerifier) {
+      return {
+        ...base,
+        status: 'unavailable',
+        reason: 'DCAP is switched off, so the upstream quote cannot be checked here',
+      };
+    }
+
+    let session;
+    try {
+      session = await fetchAttestedSession(url, sessionId);
+    } catch (err: unknown) {
+      // Sessions are retained only as long as the receipts citing them, so a
+      // miss on an old completion is expiry rather than missing evidence.
+      return {
+        ...base,
+        status: 'unavailable',
+        reason: err instanceof Error ? err.message : String(err),
+      };
+    }
+
+    const result = await verifyAttestedSession(session, {
+      expectedSessionId: sessionId,
+      expectedOrigin: upstream.origin,
+      dcapVerifier,
+    });
+
+    return {
+      status: result.verified ? 'verified' : 'failed',
+      failures: result.checks
+        .filter((check) => !check.ok)
+        .map((check) => `${check.name}${check.detail ? ` — ${check.detail}` : ''}`),
+      nonceBound: result.upstreamNonceBound,
+      upstreamTcb: result.upstream?.dcap?.status,
+      upstreamCommit: result.upstream?.sourceCommit ?? undefined,
+      unknownClaims: result.unknownClaims.length ? result.unknownClaims : upstream.unknownClaims,
+    };
   }
 
   /** One attempt at proving the anchor. Caching and failure policy live in the caller. */

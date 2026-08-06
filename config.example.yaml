@@ -105,6 +105,24 @@ verify_receipts: false
 # Set to "" to pin on first use instead.
 aci_attestation_url: "https://tee.redpill.ai"
 
+# Recheck the gateway's verdict on the machine it forwarded to, instead of
+# reading it off the receipt.
+#
+# The receipt's upstream.verified event names an attested session whose id is
+# content-addressed over the material the gateway verified — the channel
+# binding, the claims, and a digest of the upstream's own attestation report.
+# Fetching that session by id yields the report inline, so the second hop's TDX
+# quote is DCAP-verified here rather than taken on the gateway's word, and the
+# TLS key the gateway bound is checked against the upstream's attested keyset.
+#
+# One thing this cannot establish: the nonce behind that report is not
+# published, so a captured report cannot be told from a current one. Freshness
+# of the second hop still rests on the attested gateway having behaved.
+#
+# Costs one fetch and one extra DCAP run per attested channel, cached for the
+# life of the session. Needs aci_attestation_url.
+verify_upstream_sessions: true
+
 # Where receipt anchors are recorded. With aci_attestation_url set these are a
 # cache of the proven value; without it they are trust-on-first-use pins. Read
 # once at startup, so removing a stale entry needs a restart.

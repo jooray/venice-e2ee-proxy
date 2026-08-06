@@ -61,6 +61,19 @@ export interface ProxyConfig {
    * Set to an empty string to fall back to trust-on-first-use pinning.
    */
   aci_attestation_url: string;
+  /**
+   * Check the gateway's verdict on the machine it forwarded to, rather than
+   * reading it off the receipt.
+   *
+   * The receipt names an attested session whose id commits to the evidence the
+   * gateway verified. Fetching that session yields the upstream's own
+   * attestation report, so its quote can be DCAP-verified here instead of taken
+   * on the gateway's word. Costs one fetch and one extra DCAP run per session,
+   * cached for as long as the session lives.
+   *
+   * Needs `aci_attestation_url`; without it there is no gateway to ask.
+   */
+  verify_upstream_sessions: boolean;
   /** Where trust-on-first-use receipt anchors are recorded. */
   receipt_anchor_store: string;
   /**
@@ -84,6 +97,7 @@ const DEFAULTS: Omit<ProxyConfig, 'venice_api_key'> = {
   gpu_pinned_certs: [],
   verify_receipts: false,
   aci_attestation_url: 'https://tee.redpill.ai',
+  verify_upstream_sessions: true,
   receipt_anchor_store: '.venice-receipt-anchors.json',
   receipt_anchors: {},
   session_ttl: 30 * 60 * 1000, // 30 minutes
@@ -153,6 +167,10 @@ export function loadConfig(configPath?: string): ProxyConfig {
   // switches quote-bound anchoring off and returns to pinning.
   if (process.env.ACI_ATTESTATION_URL !== undefined) {
     envOverrides.aci_attestation_url = process.env.ACI_ATTESTATION_URL.trim();
+  }
+  if (process.env.VERIFY_UPSTREAM_SESSIONS !== undefined) {
+    envOverrides.verify_upstream_sessions =
+      process.env.VERIFY_UPSTREAM_SESSIONS !== 'false' && process.env.VERIFY_UPSTREAM_SESSIONS !== '0';
   }
   if (process.env.SESSION_TTL) envOverrides.session_ttl = parseInt(process.env.SESSION_TTL, 10);
   if (process.env.LOG_LEVEL) envOverrides.log_level = process.env.LOG_LEVEL;
