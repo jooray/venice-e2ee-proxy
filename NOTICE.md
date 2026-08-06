@@ -36,9 +36,11 @@ Each package below belongs to its own authors and is used under its own licence.
 | --- | --- | --- |
 | `venice-e2ee` (git submodule) | **GPL-3.0-only** | <https://github.com/elkimek/venice-e2ee> |
 
-The submodule tracks upstream `main`, pinned at `v0.4.1`. The tool-call parsing
-repairs and the NVIDIA GPU attestation work this proxy relies on were carried on
-a fork until upstream merged them; nothing is pinned outside upstream now.
+The submodule is pinned to `feat/aci-quote-bound-anchor` on
+<https://github.com/jooray/venice-e2ee>, which adds the quote-bound receipt trust
+anchor this proxy now uses. It is offered upstream and this pin returns to
+`main` once merged, as the tool-call parsing and GPU attestation work did before
+it. The fork carries no license change: it is the same GPL-3.0-only library.
 
 ### Runtime dependencies
 

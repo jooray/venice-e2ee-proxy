@@ -91,6 +91,51 @@ describe('AnchorStore', () => {
     expect(resolved.conflict).toEqual({ expected: A, observed: B });
   });
 
+  it('uses a quote-bound anchor and reports it as proven, not pinned', () => {
+    const store = new AnchorStore(storeFile);
+    const resolved = store.resolve('e2ee-glm-5-2-p', A, A);
+    expect(resolved.source).toBe('quote-bound');
+    expect(resolved.anchor).toEqual(A);
+    expect(resolved.conflict).toBeUndefined();
+  });
+
+  it('flags a keyset digest the quote did not commit to', () => {
+    // Same workload, different keyset: the substitution pinning was invented to
+    // catch, except here it can be proven rather than merely suspected.
+    const store = new AnchorStore(storeFile);
+    const observed = { workloadId: A.workloadId, workloadKeysetDigest: 'sha256:999' };
+    const resolved = store.resolve('e2ee-glm-5-2-p', observed, A);
+    expect(resolved.source).toBe('quote-bound');
+    expect(resolved.anchor).toEqual(A);
+    expect(resolved.conflict).toEqual({ expected: A, observed });
+  });
+
+  it('supersedes a stale pin with the proven value', () => {
+    new AnchorStore(storeFile).resolve('e2ee-glm-5-2-p', B);
+    const resolved = new AnchorStore(storeFile).resolve('e2ee-glm-5-2-p', A, A);
+    expect(resolved.source).toBe('quote-bound');
+    expect(JSON.parse(fs.readFileSync(storeFile, 'utf-8')).anchors['e2ee-glm-5-2-p'].workloadId)
+      .toBe(A.workloadId);
+  });
+
+  it('falls back to pinning for a model the proven workload does not cover', () => {
+    // The ACI endpoint attests one workload. A model served by another is not a
+    // conflict — there is simply nothing proven about it.
+    const store = new AnchorStore(storeFile);
+    const resolved = store.resolve('e2ee-other', B, A);
+    expect(resolved.source).toBe('first-seen');
+    expect(resolved.anchor).toEqual(B);
+    expect(resolved.conflict).toBeUndefined();
+  });
+
+  it('keeps a configured anchor ahead of a proven one', () => {
+    // The operator's out-of-band value is the one deliberate choice in the file.
+    const store = new AnchorStore(storeFile, { 'e2ee-glm-5-2-p': B });
+    const resolved = store.resolve('e2ee-glm-5-2-p', B, A);
+    expect(resolved.source).toBe('config');
+    expect(resolved.anchor).toEqual(B);
+  });
+
   it('treats an unreadable store as a first run instead of throwing', () => {
     fs.writeFileSync(storeFile, 'not json');
     const store = new AnchorStore(storeFile);

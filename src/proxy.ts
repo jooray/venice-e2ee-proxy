@@ -345,6 +345,17 @@ export class ProxyHandler {
           return;
         }
 
+        if (outcome.status === 'anchor-unproven') {
+          // Not downgraded to pinning: if an attacker can stop you proving the
+          // anchor, quietly accepting a weaker one is the outcome they wanted.
+          logger.error(
+            `Receipt anchor could not be proven for ${upstreamModel}: ${outcome.reason}. ` +
+              `Receipts are not being verified. Clear aci_attestation_url to fall back to ` +
+              `trust-on-first-use pinning, accepting that it proves nothing about the first use.`
+          );
+          return;
+        }
+
         if (outcome.status === 'anchor-conflict') {
           logger.error(
             `Receipt anchor CHANGED for ${upstreamModel} — ${outcome.reason}. ` +
@@ -356,8 +367,6 @@ export class ProxyHandler {
           return;
         }
 
-        reportUpstreamVerification(upstreamModel, requestId, outcome.upstream);
-
         const { result, anchorSource, bodyBindingOk } = outcome;
         const failed = result.checks.filter((check) => !check.ok);
         const otherFailures = failed.filter(
@@ -368,11 +377,18 @@ export class ProxyHandler {
         // hashes are still meaningful; the anchor is not, and saying "verified"
         // without that caveat would overstate it.
         const anchorNote =
-          anchorSource === 'first-seen'
-            ? ' (anchor recorded on this request — pinned, not yet corroborated)'
-            : anchorSource === 'config'
-              ? ' (anchor from config)'
-              : '';
+          anchorSource === 'quote-bound'
+            ? ' (anchor proven from the attested quote)'
+            : anchorSource === 'first-seen'
+              ? ' (anchor recorded on this request — pinned, not yet corroborated)'
+              : anchorSource === 'config'
+                ? ' (anchor from config)'
+                : '';
+
+        // Everything a caller behind Venice can reproduce. The two body hashes
+        // are excluded because they never reproduce from here, so requiring them
+        // would make every receipt look unauthentic.
+        const authentic = otherFailures.length === 0;
 
         if (result.verified) {
           logger.info(`Receipt verified for ${requestId} (${upstreamModel})${anchorNote}`);
@@ -391,6 +407,20 @@ export class ProxyHandler {
             otherFailures.map((c) => `${c.name}${c.detail ? ` — ${c.detail}` : ''}`).join('; ')
           );
         }
+
+        // Deliberately after the checks above. The gateway's verdict on its own
+        // upstream lives in the receipt's event log, so it is only worth as much
+        // as the signature over that log. Reporting it before checking the
+        // signature would present attacker-supplied text as a verified finding.
+        if (authentic) {
+          reportUpstreamVerification(upstreamModel, requestId, outcome.upstream);
+        } else {
+          logger.warn(
+            `Not reporting the upstream verdict for ${requestId} (${upstreamModel}): the receipt ` +
+            `carrying it did not verify, so its event log is not authenticated.`
+          );
+        }
+
         debugDump('receipt', {
           model: upstreamModel,
           request_id: requestId,

@@ -80,7 +80,8 @@ cp .env.example .env
 | `NRAS_URL` | NVIDIA NRAS | Override the GPU attestation endpoint |
 | `NRAS_JWKS_URL` | NVIDIA JWKS | Override where NVIDIA's signing keys come from |
 | `VERIFY_RECEIPTS` | `false` | Verify the receipt for each completion ([details](#response-receipts)) |
-| `RECEIPT_ANCHOR_STORE` | `.venice-receipt-anchors.json` | Where trust-on-first-use anchors are recorded |
+| `RECEIPT_ANCHOR_STORE` | `.venice-receipt-anchors.json` | Where receipt anchors are recorded |
+| `ACI_ATTESTATION_URL` | `https://tee.redpill.ai` | Gateway origin whose quote proves the receipt anchor; `""` pins on first use |
 | `SESSION_TTL` | `1800000` | Session TTL in ms |
 | `LOG_LEVEL` | `info` | debug, info, warn, error |
 
@@ -395,13 +396,37 @@ INFO  Receipt authentic for 0b56cc7a57e14e69a7269ae25288a830 (e2ee-glm-5-2-p): s
 
 It says "authentic" rather than "verified" deliberately. `verified` is the library's own field, and it is `false` on every completion because of the two body-hash checks below. Reporting that as a failure would be accurate and useless.
 
-### The trust anchor is pinned, not proven
+### The trust anchor is proven from the quote
 
 `verifyReceipt` needs a workload identity and keyset digest it can trust, and refuses to take them from the response being checked, since a provider serving both sides would just make them agree.
 
-There is no cryptographic source for those values today. Venice's TDX quote binds the signing address and your nonce, and says nothing about the ACI keyset digest. The `keyset_endorsement` signature sitting next to it could close that gap, but its message construction is undocumented; 112 candidate reconstructions failed to recover the attested signer, the same wall the top-level secp256k1 signature runs into.
+Venice's own attestation endpoint cannot supply them. Its `report_data` decodes as `[address(20) | zeros(12) | nonce(32)]`, which binds the E2EE key and your nonce and says nothing about the ACI keyset digest. This is why the proxy used to pin on first use, the way SSH pins a host key.
 
-So the proxy pins on first use, the way SSH pins a host key. The first attestation for a model is recorded to `receipt_anchor_store`, and every later one has to match. A change is an error, not a silent update:
+It no longer has to. The same enclave answers the native ACI protocol at `GET /v1/aci/attestation`, unauthenticated, on its own hostnames, and that report's quote covers
+
+```
+sha256(JCS({purpose: "aci.report_data.v1", workload_id, workload_keyset_digest, nonce}))
+```
+
+so a DCAP-verified quote commits to the keyset digest directly. The proxy fetches that report with a fresh nonce, verifies the quote against Intel's roots, recomputes the statement, and uses the result as the anchor:
+
+```
+INFO  Receipt anchor proven from the attested quote at https://tee.redpill.ai:
+      sha256:c5c0f582… (gateway source aa65d64c…, TCB UpToDate)
+INFO  Receipt authentic for a68ccd5b… (e2ee-glm-5-2-p) (anchor proven from the
+      attested quote): signature, keyset and chat id check out.
+```
+
+Reaching the report over a different hostname is not a weakness. The quote authenticates itself, and the digest it commits to is compared against the one Venice reports; if they agree, the keyset Venice serves is the keyset the quote covers. The endpoint is set by `aci_attestation_url` and the result is cached until the report's own freshness window ends.
+
+If the report cannot be fetched or fails to verify, receipts are reported as unverifiable rather than quietly falling back to pinning. An attacker who can block one endpoint should not be able to talk you down to a weaker anchor:
+
+```
+ERROR Receipt anchor could not be proven for e2ee-glm-5-2-p: could not reach
+      https://tee.redpill.ai: fetch failed. Receipts are not being verified.
+```
+
+Set `aci_attestation_url: ""` to pin on first use instead. Pinning also still covers any model served by a workload other than the one that endpoint attests. A pin that disagrees with the attestation is an error rather than a silent update:
 
 ```
 ERROR Receipt anchor CHANGED for e2ee-glm-5-2-p — pinned sha256:3def…/sha256:dead…,
@@ -409,7 +434,7 @@ ERROR Receipt anchor CHANGED for e2ee-glm-5-2-p — pinned sha256:3def…/sha256
       is not the one pinned.
 ```
 
-This catches a substituted keyset or a silent downgrade. It does not establish that the enclave was genuine at pin time: pin what Venice says and you have pinned Venice's claim. The first request says so explicitly. If you have an out-of-band source for the digest, set it under `receipt_anchors` and it takes precedence:
+If you have an out-of-band source for the digest, set it under `receipt_anchors` and it takes precedence over both:
 
 ```yaml
 receipt_anchors:
@@ -424,7 +449,7 @@ The store is read once at startup, so edits need a restart.
 
 A receipt carries hashes of the request and response bytes. Measured against the live API, those two checks never pass from behind `api.venice.ai`. They fail identically on both paths, streaming or not, which places a re-serializing hop between this proxy and the enclave issuing the receipt. Venice demonstrably re-wraps responses, adding `cost` and `venice_parameters`, and the request hashes point the same way.
 
-The proxy reports this rather than failing, since a failure on every completion would just teach you to ignore it. So a receipt buys you the fact that the attested enclave signed a receipt for this completion id, 12 of the 14 checks below. It does not buy proof that the bytes you received are the ones it produced. Only something sitting directly in front of the ACI gateway could establish that.
+The proxy reports this rather than failing, since a failure on every completion would just teach you to ignore it. So a receipt buys you the fact that the attested enclave signed a receipt for this completion id, and separately vouched for a pair of body hashes with the key its quote binds — 14 of the 16 checks below. It does not buy proof that the bytes you received are the ones it produced. Only something sitting directly in front of the ACI gateway could establish that.
 
 ### Not every model issues receipts
 
@@ -434,7 +459,7 @@ Models can also share a workload, in which case they pin to the same anchor, rec
 
 ### The checks
 
-Fourteen run, and the library's `verified` requires every one.
+Sixteen run, and the library's `verified` requires every one.
 
 | Check | What it rules out |
 |---|---|
@@ -444,18 +469,22 @@ Fourteen run, and the library's `verified` requires every one.
 | `keyset_digest_matches_trust_anchor` | a substituted keyset, since the digest is recomputed rather than read |
 | `attestation_keyset_digest_matches_trust_anchor` | the attestation pointing at a different keyset than the anchor |
 | `receipt_keyset_digest_matches_trust_anchor` | the receipt naming a keyset other than the anchored one |
-| `workload_id_matches_trust_anchor` | a receipt from a different workload than the pinned one |
+| `workload_id_matches_trust_anchor` | a receipt from a different workload than the anchored one |
 | `key_in_trusted_keyset` | a receipt signed by a key the enclave never vouched for |
 | `key_algo_matches` | algorithm confusion between receipt and keyset |
 | `receipt_signature` | any edit to the receipt or its event log |
 | `chat_id_matches_request` | a valid receipt for somebody else's completion |
 | `signing_address_cross_check` | the two endpoints describing different enclaves |
+| `signed_text_matches_receipt_hashes` | a valid signature over some other pair of hashes |
+| `signature_recovers_to_attested_key` | body hashes vouched for by a key the quote does not bind |
 | `request_body_hash_matches` | never passes from here, see above |
 | `response_body_hash_matches` | never passes from here, see above |
 
 Four of these compare against the trust anchor rather than the response. That is the point: a provider serving both the receipt and the attestation could make them agree with each other, but not with a value pinned earlier.
 
-The signature is Ed25519 over the RFC 8785 (JCS) canonicalization of the receipt with `signature.value` removed, under a key from `attestation.workload_keyset.receipt_signing_keys`, which is the scheme Phala's [private-ai-gateway](https://github.com/Dstack-TEE/private-ai-gateway) reference verifier implements. The top-level secp256k1 `signature` over `<request-hash>:<response-hash>` in the same response is not what gets checked; its message construction is undocumented and the reference verifier ignores it.
+The signature is Ed25519 over the RFC 8785 (JCS) canonicalization of the receipt with `signature.value` removed, under a key from `attestation.workload_keyset.receipt_signing_keys`, which is the scheme Phala's [private-ai-gateway](https://github.com/Dstack-TEE/private-ai-gateway) reference verifier implements.
+
+The top-level secp256k1 `signature` over `<request-hash>:<response-hash>` in the same response is checked too, and is worth more than its placement suggests. It is EIP-191 `personal_sign`, made by the key whose Ethereum address the TDX quote carries in REPORTDATA — the only binding in a receipt that reaches the quote without passing through the keyset. The signed text is recomputed from the receipt's own hash events, so a valid signature describing some other pair of hashes fails.
 
 ## Function calling
 

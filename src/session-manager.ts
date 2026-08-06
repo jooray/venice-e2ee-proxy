@@ -1,4 +1,10 @@
-import { BODY_BINDING_CHECKS, createVeniceE2EE, isE2EEModel, verifyReceipt } from 'venice-e2ee';
+import {
+  BODY_BINDING_CHECKS,
+  createVeniceE2EE,
+  establishAciTrustAnchor,
+  isE2EEModel,
+  verifyReceipt,
+} from 'venice-e2ee';
 import type {
   E2EESession,
   VeniceE2EEOptions,
@@ -6,7 +12,12 @@ import type {
   ReceiptResponseHashField,
 } from 'venice-e2ee';
 import type { ProxyConfig } from './config.js';
-import { AnchorStore, readObservedAnchor, type AnchorSource } from './receipt-anchors.js';
+import {
+  AnchorStore,
+  readObservedAnchor,
+  type AnchorSource,
+  type TrustAnchor,
+} from './receipt-anchors.js';
 import { logger } from './logger.js';
 
 /**
@@ -28,7 +39,14 @@ export type ReceiptOutcome =
       upstream: UpstreamVerification | null;
     }
   | { status: 'unavailable'; reason: string }
-  | { status: 'anchor-conflict'; reason: string };
+  | { status: 'anchor-conflict'; reason: string }
+  /**
+   * Quote-bound anchoring was asked for and could not be completed. Reported
+   * rather than quietly falling back to pinning: silently downgrading the trust
+   * anchor when the proof is unavailable is exactly what an attacker who can
+   * block one endpoint would want.
+   */
+  | { status: 'anchor-unproven'; reason: string };
 
 /**
  * The gateway's own record of checking the machine it forwarded your prompt to.
@@ -97,6 +115,20 @@ export function stripTeePrefix(modelId: string): string {
 }
 
 /**
+ * An anchor established from the gateway's quote, or the reason it could not be.
+ *
+ * `anchor: null` with no `reason` means quote-bound anchoring was never asked
+ * for; with a `reason` it means it was asked for and failed, which is not the
+ * same thing and must not be treated as one.
+ */
+interface ProvenAnchor {
+  anchor: TrustAnchor | null;
+  reason?: string;
+  /** Unix seconds after which the report that produced this anchor goes stale. */
+  staleAfter?: number | null;
+}
+
+/**
  * Manages E2EE sessions across multiple models.
  * Each model gets its own createVeniceE2EE instance, which internally
  * caches a single session with TTL and deduplicates concurrent creation.
@@ -113,6 +145,9 @@ export class SessionManager {
   private dcapVerifier?: VeniceE2EEOptions['dcapVerifier'];
   private gpuVerifier?: VeniceE2EEOptions['gpuVerifier'];
   private anchors: AnchorStore;
+  /** Cached outcome of proving an anchor from the gateway's own quote. */
+  private provenAnchor: (ProvenAnchor & { expiresAt: number }) | null = null;
+  private provenAnchorPending: Promise<ProvenAnchor> | null = null;
 
   constructor(config: ProxyConfig) {
     this.config = config;
@@ -269,6 +304,86 @@ export class SessionManager {
     return { verified: session.attestation !== undefined };
   }
 
+  /** How long a failed anchor proof is remembered, so receipts cannot become a retry storm. */
+  private static readonly ANCHOR_FAILURE_TTL_MS = 60_000;
+
+  /**
+   * Establish the receipt trust anchor from the gateway's own attestation quote.
+   *
+   * The gateway's native ACI report puts `sha256(JCS({purpose, workload_id,
+   * workload_keyset_digest, nonce}))` in REPORTDATA, so a DCAP-verified quote
+   * commits to the keyset digest. That is the whole difference between an anchor
+   * that is proven and one that has merely been seen before.
+   *
+   * Cached, because it costs a 50 kB fetch and a full DCAP verification, and the
+   * answer is a property of the enclave rather than of the request. The cache
+   * never outlives the report's own freshness window.
+   *
+   * Returns `{ anchor: null, reason }` rather than throwing: an unprovable
+   * anchor stops receipt verification, and must never quietly become a pin.
+   */
+  private async getProvenAnchor(): Promise<ProvenAnchor> {
+    const url = this.config.aci_attestation_url?.trim();
+    if (!url) return { anchor: null };
+
+    const cached = this.provenAnchor;
+    if (cached && Date.now() < cached.expiresAt) {
+      return { anchor: cached.anchor, reason: cached.reason };
+    }
+    if (this.provenAnchorPending) return this.provenAnchorPending;
+
+    this.provenAnchorPending = this.proveAnchor(url)
+      .catch((err: unknown): ProvenAnchor => ({
+        anchor: null,
+        reason: `could not reach ${url}: ${err instanceof Error ? err.message : String(err)}`,
+      }))
+      .then((outcome) => {
+        const staleAt = outcome.staleAfter ? outcome.staleAfter * 1000 : Number.POSITIVE_INFINITY;
+        this.provenAnchor = {
+          anchor: outcome.anchor,
+          reason: outcome.reason,
+          expiresAt: outcome.anchor
+            ? Math.min(Date.now() + this.config.session_ttl, staleAt)
+            : Date.now() + SessionManager.ANCHOR_FAILURE_TTL_MS,
+        };
+        return outcome;
+      })
+      .finally(() => {
+        this.provenAnchorPending = null;
+      });
+
+    return this.provenAnchorPending;
+  }
+
+  /** One attempt at proving the anchor. Caching and failure policy live in the caller. */
+  private async proveAnchor(url: string): Promise<ProvenAnchor> {
+    const dcapVerifier = await this.getDcapVerifier();
+    if (!dcapVerifier) {
+      return {
+        anchor: null,
+        reason:
+          'quote-bound anchoring needs DCAP verification, which is switched off or unavailable ' +
+          '(set enable_dcap: true, or clear aci_attestation_url to pin instead)',
+      };
+    }
+
+    const result = await establishAciTrustAnchor(url, { dcapVerifier });
+    if (!result.anchor) {
+      const failures = result.checks
+        .filter((check) => !check.ok)
+        .map((check) => `${check.name}${check.detail ? ` — ${check.detail}` : ''}`)
+        .join('; ');
+      return { anchor: null, reason: `attestation from ${url} did not verify: ${failures}` };
+    }
+
+    logger.info(
+      `Receipt anchor proven from the attested quote at ${url}: ` +
+        `${result.anchor.workloadKeysetDigest} (gateway source ${result.sourceCommit ?? 'unstated'}, ` +
+        `TCB ${result.dcap?.status ?? 'unreported'})`
+    );
+    return { anchor: result.anchor, staleAfter: result.staleAfter };
+  }
+
   /**
    * Fetch and verify the signed receipt for a completion.
    *
@@ -299,7 +414,15 @@ export class SessionManager {
       };
     }
 
-    const resolution = this.anchors.resolve(modelId, observed);
+    const proven = await this.getProvenAnchor();
+    if (this.config.aci_attestation_url?.trim() && !proven.anchor) {
+      return {
+        status: 'anchor-unproven',
+        reason: proven.reason ?? 'the gateway quote did not yield a trust anchor',
+      };
+    }
+
+    const resolution = this.anchors.resolve(modelId, observed, proven.anchor);
     if (resolution.conflict) {
       return {
         status: 'anchor-conflict',

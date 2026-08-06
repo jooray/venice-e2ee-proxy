@@ -3,27 +3,29 @@ import path from 'node:path';
 import { logger } from './logger.js';
 
 /**
- * Trust-on-first-use store for receipt trust anchors.
+ * Trust anchors for receipt verification — proven where possible, pinned where not.
  *
  * `verifyReceipt` needs a workload identity and keyset digest it can trust, and
- * refuses to take them from the response being checked — otherwise a provider
- * serving both sides just makes them agree.
+ * refuses to take them from the response being checked, since a provider serving
+ * both sides just makes them agree.
  *
- * There is no cryptographic source for those values today. Venice's TDX quote
- * binds the signing address and the client nonce (`report_data` decodes as
- * `[address(20) | zeros(12) | nonce(32)]`) and says nothing about the ACI keyset
- * digest. The `keyset_endorsement` signature alongside it could close that gap,
- * but its message construction is undocumented and 112 candidate reconstructions
- * failed to recover the attested signer.
+ * Venice's `/api/v1/tee/attestation` cannot supply them: its `report_data`
+ * decodes as `[address(20) | zeros(12) | nonce(32)]`, which binds the E2EE key
+ * and the nonce and says nothing about the keyset. That is why this used to pin
+ * on first use, the way SSH pins a host key.
  *
- * So this pins instead of proving, the way SSH pins a host key. The first
- * attestation for a model is recorded; every later one has to match. That does
- * not establish the enclave was ever genuine — pin what Venice says and you have
- * pinned Venice's claim — but it does catch the digest changing underneath you,
- * which is what a substituted keyset or a silent downgrade looks like.
+ * It no longer has to. The same enclave answers the native ACI protocol, whose
+ * quote covers `sha256(JCS({purpose, workload_id, workload_keyset_digest,
+ * nonce}))` — so a DCAP-verified quote commits to the digest. When the caller
+ * supplies an anchor established that way, it is used and reported as
+ * `quote-bound`, and a stored pin that disagrees with it loses: a value proven
+ * against Intel's roots outranks one that was merely seen first.
  *
- * The distinction is kept in the result rather than smoothed over: a pin
- * recorded on this very request is reported as `first-seen`, not as a match.
+ * Pinning remains for the models that proof cannot reach — a workload other than
+ * the one the ACI endpoint attests, or an operator who switched the endpoint
+ * off. The distinction stays in the result rather than being smoothed over: a
+ * pin recorded on this very request is reported as `first-seen`, never as a
+ * match, and a proven anchor is never reported as a pin.
  */
 
 export const DEFAULT_ANCHOR_STORE = '.venice-receipt-anchors.json';
@@ -34,6 +36,8 @@ export interface TrustAnchor {
 }
 
 export type AnchorSource =
+  /** Derived from a DCAP-verified quote that commits to this keyset digest. */
+  | 'quote-bound'
   /** Operator supplied it in config — the only case with provenance outside Venice. */
   | 'config'
   /** Matched a previously recorded pin. */
@@ -81,8 +85,19 @@ export class AnchorStore {
    * A conflict is reported, never silently overwritten: the whole point of the
    * pin is that the second value is the suspicious one.
    */
-  resolve(modelId: string, observed: TrustAnchor): AnchorResolution {
+  resolve(modelId: string, observed: TrustAnchor, proven?: TrustAnchor | null): AnchorResolution {
     const configured = this.pins[modelId];
+    if (!configured && proven && proven.workloadId === observed.workloadId) {
+      // Same workload, so the quote speaks to this model. A digest that differs
+      // from the proven one is exactly the substitution the anchor exists to
+      // catch, and here it can be called rather than guessed at.
+      if (proven.workloadKeysetDigest !== observed.workloadKeysetDigest) {
+        return { anchor: proven, source: 'quote-bound', conflict: { expected: proven, observed } };
+      }
+      this.recordProven(modelId, proven);
+      return { anchor: proven, source: 'quote-bound' };
+    }
+
     if (configured) {
       const agrees =
         configured.workloadId === observed.workloadId &&
@@ -116,6 +131,37 @@ export class AnchorStore {
     return agrees
       ? { anchor: expected, source: 'pinned' }
       : { anchor: expected, source: 'pinned', conflict: { expected, observed } };
+  }
+
+  /**
+   * Keep the store aligned with what the quote proved.
+   *
+   * A pin that disagrees is superseded rather than reported as a conflict: the
+   * proven value is the better one by construction, so the stored disagreement
+   * says the pin was stale (or was recorded before proof was available), not
+   * that something is being substituted now. It is still worth saying out loud,
+   * because a pin quietly changing is the event this file exists to surface.
+   */
+  private recordProven(modelId: string, proven: TrustAnchor): void {
+    const store = this.load();
+    const stored = store[modelId];
+    if (
+      stored &&
+      stored.workloadId === proven.workloadId &&
+      stored.workloadKeysetDigest === proven.workloadKeysetDigest
+    ) {
+      return;
+    }
+
+    if (stored) {
+      logger.warn(
+        `Replacing the recorded receipt anchor for ${modelId} with a quote-bound one: ` +
+          `was ${stored.workloadId} / ${stored.workloadKeysetDigest}, ` +
+          `the attested quote commits to ${proven.workloadId} / ${proven.workloadKeysetDigest}.`
+      );
+    }
+    store[modelId] = { ...proven, first_seen_at: new Date().toISOString() };
+    this.save(store);
   }
 
   private load(): Record<string, StoredAnchor> {

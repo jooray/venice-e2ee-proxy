@@ -84,15 +84,30 @@ gpu_pinned_certs: []
 # receipt for your completion id. Costs two extra round trips per request, run
 # after the response is already sent, so results are logged rather than returned.
 #
-# Read the Response Receipts section of the README before relying on this. Two
-# limits, both measured rather than assumed:
-#   - the trust anchor is pinned on first use, not cryptographically proven
-#   - the request/response body hashes cannot be reproduced from behind
-#     api.venice.ai, so those two checks never pass
+# Read the Response Receipts section of the README before relying on this. One
+# limit remains, measured rather than assumed: the request/response body hashes
+# cannot be reproduced from behind api.venice.ai, so those two checks never pass.
 verify_receipts: false
 
-# Where trust-on-first-use receipt anchors are recorded. Read once at startup,
-# so removing a stale pin needs a restart.
+# Gateway origin serving the native ACI attestation report, whose TDX quote
+# covers sha256(JCS({purpose, workload_id, workload_keyset_digest, nonce})) — so
+# a DCAP-verified quote commits to the keyset digest, and the receipt trust
+# anchor is proven rather than pinned on first use.
+#
+# This is not api.venice.ai, and it takes no API key. Venice's own attestation
+# endpoint serves the legacy report shape, which binds the E2EE key and nonce
+# and says nothing about the keyset. Reaching the report over a different
+# hostname costs nothing: the quote authenticates itself against Intel's roots,
+# and the digest it commits to is checked against the one Venice reports.
+#
+# Requires enable_dcap. If the report cannot be fetched or verified, receipts
+# are reported as unverifiable rather than quietly falling back to pinning.
+# Set to "" to pin on first use instead.
+aci_attestation_url: "https://tee.redpill.ai"
+
+# Where receipt anchors are recorded. With aci_attestation_url set these are a
+# cache of the proven value; without it they are trust-on-first-use pins. Read
+# once at startup, so removing a stale entry needs a restart.
 receipt_anchor_store: ".venice-receipt-anchors.json"
 
 # Anchors you established out of band. These win over anything pinned on first

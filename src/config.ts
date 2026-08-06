@@ -48,6 +48,19 @@ export interface ProxyConfig {
    */
   gpu_pinned_certs: string[];
   verify_receipts: boolean;
+  /**
+   * Gateway origin serving the native ACI attestation report, whose quote binds
+   * the workload keyset digest. When set, receipt anchors are derived from that
+   * quote instead of pinned on first use, which is the difference between
+   * proving the anchor and merely having seen it before.
+   *
+   * The endpoint is unauthenticated and is not `api.venice.ai`. Reaching it over
+   * a different hostname is not a weakness: the quote authenticates itself, and
+   * the digest it commits to is compared against the one Venice reports.
+   *
+   * Set to an empty string to fall back to trust-on-first-use pinning.
+   */
+  aci_attestation_url: string;
   /** Where trust-on-first-use receipt anchors are recorded. */
   receipt_anchor_store: string;
   /**
@@ -70,6 +83,7 @@ const DEFAULTS: Omit<ProxyConfig, 'venice_api_key'> = {
   verify_gpu_token_signatures: true,
   gpu_pinned_certs: [],
   verify_receipts: false,
+  aci_attestation_url: 'https://tee.redpill.ai',
   receipt_anchor_store: '.venice-receipt-anchors.json',
   receipt_anchors: {},
   session_ttl: 30 * 60 * 1000, // 30 minutes
@@ -134,6 +148,11 @@ export function loadConfig(configPath?: string): ProxyConfig {
   }
   if (process.env.RECEIPT_ANCHOR_STORE) {
     envOverrides.receipt_anchor_store = process.env.RECEIPT_ANCHOR_STORE;
+  }
+  // Deliberately not guarded on truthiness: an empty value is how an operator
+  // switches quote-bound anchoring off and returns to pinning.
+  if (process.env.ACI_ATTESTATION_URL !== undefined) {
+    envOverrides.aci_attestation_url = process.env.ACI_ATTESTATION_URL.trim();
   }
   if (process.env.SESSION_TTL) envOverrides.session_ttl = parseInt(process.env.SESSION_TTL, 10);
   if (process.env.LOG_LEVEL) envOverrides.log_level = process.env.LOG_LEVEL;
