@@ -38,9 +38,11 @@ Each package below belongs to its own authors and is used under its own licence.
 
 The submodule is pinned to `feat/aci-quote-bound-anchor` on
 <https://github.com/jooray/venice-e2ee>, which adds the quote-bound receipt trust
-anchor this proxy now uses. It is offered upstream and this pin returns to
-`main` once merged, as the tool-call parsing and GPU attestation work did before
-it. The fork carries no license change: it is the same GPL-3.0-only library.
+anchor and the upstream-session verification this proxy now uses. It is offered
+upstream as [PR #13](https://github.com/elkimek/venice-e2ee/pull/13), and this
+pin returns to `main` once merged, as the tool-call parsing and GPU attestation
+work did before it. The fork carries no license change: it is the same
+GPL-3.0-only library.
 
 ### Runtime dependencies
 
