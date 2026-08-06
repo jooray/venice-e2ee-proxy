@@ -12,6 +12,100 @@ the pinned gateway commit `aa65d64c191949b8df7b1ebe210f5b8f8a8e6b99` of
 
 ---
 
+## Abstract
+
+**What this is.** The proxy encrypts prompts on your machine to a key carried in
+an Intel TDX attestation, so Venice's network and infrastructure never hold
+plaintext. Decryption happens inside a Phala-operated enclave — the *gateway* —
+which then forwards your plaintext to an inference *router*, which forwards it
+to a *GPU node*. "End-to-end" therefore means end-to-**enclave**, not
+end-to-nobody. The question worth auditing is not whether the encryption works;
+it does. It is what those enclaves are, and how much of the claim about them you
+can check yourself rather than take on someone's word.
+
+**What you verify yourself.** The chain runs from Intel's roots to the machine
+that answered your prompt, and every link below is recomputed client-side.
+DCAP-verify the gateway's TDX quote against Intel's PCK roots and CRLs, which
+establishes genuine, current silicon in a non-debug TD. That quote's REPORTDATA
+binds three things: the key you encrypt to, the nonce you chose (so it describes
+*this* session), and — on the enclave's native ACI endpoint — the digest of its
+workload keyset. That third binding is what makes the rest possible: the keyset
+contains the receipt-signing keys, so the signed receipt for your completion
+verifies under an anchor proven by Intel rather than pinned on first sight. The
+receipt's event log then carries the gateway's verdict on the machine it
+forwarded to, along with a content-addressed session id. Fetch that session,
+recompute its id, and you get the router's own attestation report inline — whose
+quote you DCAP-verify too, and whose attested TLS key must be the one the gateway
+actually dialled. Separately, NVIDIA vouches for the GPU evidence served with the
+attestation, with your nonce in the token — though the enclave that serves it
+reports `num_gpus: 0`, so that verdict is about *a* confidential GPU rather than
+the one that ran your prompt. Finally, a secp256k1 signature made by the
+quote-bound key covers the request and response hashes.
+
+**What the gateway verifies on your behalf.** Before forwarding, the gateway runs
+its own verifier (`aci-service/v2`) against the router: full DCAP with
+collateral, an RTMR3 replay from the event log matched against the quote, the
+`app_compose` preimage matched to the RTMR3-bound compose hash, the KMS custody
+chain, and a channel binding requiring the router's TLS SPKI to be in its
+attested keyset for the host being dialled. This is a real check, not a
+formality — and since the evidence behind it is served and committed to, you
+re-run the substance of it yourself rather than trusting the summary. The router
+runs an analogous check one hop further down against the GPU nodes, under a
+different verifier (`private-ai-verifier/phala-direct/v1`, which treats GPU
+evidence as supplemental and never as a gate). But that verdict is published only
+as an unsigned list, and the GPU nodes' own attestation endpoint answers 401
+without the router's bearer token — so the third hop is where independent
+checking stops, and you have the router's word for it.
+
+**Where it is lacking.** Four gaps, roughly in order of how much they matter.
+*The serving software is unattested at every hop*: `serving_software_known_good`
+and `model_weights_provenance` are `unknown` in every claim set, which means the
+program that actually reads your prompt and the weights it runs are the one thing
+nobody measures. *The quote measures a recipe, not a binary*: the gateway is
+built from source at boot with a persistent, unmeasured cargo cache, and
+`image_digest` is null, so the attestation fixes an instruction to build a commit
+rather than the artifact that ran — on a dev OS image, with `secure_time: false`
+and `public_logs: true`. *Runtime state sits outside the quote*: the routing
+table is installed through an admin token, an SSH key may or may not have been
+injected (`DSTACK_ROOT_PUBLIC_KEY` is in `allowed_envs` and attestation cannot
+tell you which), and an external control plane picks your route per request.
+*Two bindings stay out of reach*: the gateway does not publish the nonce behind
+the router's report, so that hop's freshness rests on the gateway having
+behaved; and Venice re-serialises request and response bodies, so the receipt's
+body hashes never reproduce from a client's vantage point. Add to this that
+upstream verification is advisory rather than enforced on the domain Venice's
+traffic actually uses (`required: false`), and that nothing ties the
+NVIDIA-attested GPU to the TDX-attested CPU beyond a shared nonce.
+
+### The wins that would make this real
+
+In rough order of value per unit of effort: **measure the serving software and
+weights**, because an unattested inference stack makes every attested hop above
+it a proof about the wrong thing — this is the single change that would turn
+"confidential inference" from a deployment property into a verifiable one;
+**ship the gateway as a digest-pinned, reproducibly built image** instead of
+compiling from source at boot against a mutable cache, so the quote measures the
+binary that ran rather than an instruction to produce one; **run a production
+dstack image with no SSH**, dropping `DSTACK_ROOT_PUBLIC_KEY` from
+`allowed_envs`, turning off serial console, and — if remote access must stay
+possible — reflecting in the attestation evidence whether a key was actually
+injected, since "an operator might have root inside the enclave and you cannot
+tell" undoes much of what the quote establishes; **enforce upstream verification
+on the route Venice actually uses** by putting `api.redpill.ai` in
+`tee_only_domains` and accepting `provider.aci_verified` from clients, so a
+failed check blocks a request instead of being noted in a receipt afterwards;
+**publish the nonce behind each upstream report** (or chain it to the caller's),
+which closes the last freshness gap in the transitive chain for the cost of one
+field; and **stop re-serialising between clients and the gateway**, so the two
+body-hash checks that can never pass today become the proof that the bytes you
+received are the bytes the enclave produced. One through three and five are
+Phala's to make, six is Venice's, and four needs both: Venice to accept the flag
+on its API, Phala to add the domain to the measured `tee_only_domains`. None of
+them requires new cryptography — every one is a deployment or plumbing decision
+that the protocol already accommodates.
+
+---
+
 ## 0. Verification pass — 2026-08-06
 
 Every claim above was re-checked against the code, the pinned gateway source,
