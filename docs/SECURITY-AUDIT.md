@@ -99,6 +99,40 @@ four needs both: Venice to accept the flag on its API, Phala to add the domain t
 the measured `tee_only_domains`. None of them requires new cryptography. Every
 one is a deployment or plumbing decision the protocol already accommodates.
 
+### How this reads next to the other providers
+
+This audit covers one provider and one client. The cross-provider version is
+Andrew Miller's [awesome-private-inference](https://github.com/amiller/awesome-private-inference)
+([dashboard](https://amiller.github.io/awesome-private-inference/)), a registry
+that re-verifies attestation bundles from Venice, NEAR AI, Tinfoil, Chutes and
+RedPill/Phala every day and scores which layers each one proves. Its finding is
+that none of them is complete, and the shapes recur: serving code excluded from
+the measurement, mutable image tags, operator SSH on dev OS images, gateway
+checks that are advisory rather than enforced. Read alongside §2.4, it is
+useful for telling which of the gaps below are Venice's and which are what the
+whole category currently looks like. The per-provider reasoning lives in
+[devproof-audits-guide](https://github.com/amiller/devproof-audits-guide/tree/main/case-studies),
+whose [Venice case study](https://github.com/amiller/devproof-audits-guide/blob/main/case-studies/venice-private-inference/DEVPROOF-REPORT.md)
+(2026-04-24) takes the complementary angle to this one: it confirms the wire
+protocol by live probe and then goes after `veniceai/skills`, the agent-facing
+guidance, which misnames ECIES as HPKE or Noise, points at a 404, and teaches
+none of the verification this proxy performs. That is the trust-on-first-use
+hole the client side of this document is written to avoid.
+
+The registry revised Venice's score on 2026-08-10 after reading this audit.
+`prod_os_image` and `serving_code_attested` had been left out of Venice's
+required layers on the grounds that the backend belongs to NEAR or Phala, which
+made Venice the only complete row on the dashboard. Those are exactly the two
+layers where §2.4 locates the prompt-path exposure: the dev OS image with
+`DSTACK_ROOT_PUBLIC_KEY` in `allowed_envs`, and the unmeasured serving software
+at the hop that holds plaintext. Venice now reads 6 of 9, Stage 1 with a
+verifying proxy and Stage 0 for the infrastructure and the skill. The registry's
+own post-mortem on having set the bar wrong is
+[issue #11](https://github.com/amiller/awesome-private-inference/issues/11), and
+the general fix, deriving each provider's bar from its claims rather than from
+what its API happens to expose, is
+[issue #6](https://github.com/amiller/awesome-private-inference/issues/6).
+
 ---
 
 ## 0. Verification pass, 2026-08-06
