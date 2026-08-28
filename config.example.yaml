@@ -175,15 +175,13 @@ log_level: "info"
 # Function Calling section of the README.
 #
 # Not every E2EE model supports tools. Verified working with function calling
-# over E2EE (catalog last checked 2026-08-28):
+# over E2EE, but Venice adds and drops models often, so check the live list
+# rather than trusting these ids:
 #   e2ee-glm-5-2-p        524K ctx  32K out  $1.75/$5.75 per M tokens
 #   e2ee-deepseek-v4-flash 1M ctx   8K out  $0.182/$0.373
 #   e2ee-qwen3-6-35b-a3b   32K ctx   4K out  $0.182/$1.18
-# (e2ee-gemma-4-31b was listed here previously — it advertises reasoning but
-#  NOT function calling, and was never a valid agent model. Venice has since
-#  delisted it, along with e2ee-qwen3-6-27b, which was listed here.)
 # e2ee-qwen3-vl-30b-a3b-p advertises FC but the attestation endpoint 502s —
-# re-probe before adding. e2ee-qwen3-30b-a3b-p had the same fault and is gone.
+# re-probe before adding.
 # Check the current list:
 #   curl -H "Authorization: Bearer $VENICE_API_KEY" \
 #     "https://api.venice.ai/api/v1/models?type=text"

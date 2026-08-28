@@ -479,7 +479,7 @@ The proxy reports this rather than failing, since a failure on every completion 
 
 `e2ee-deepseek-v4-flash` attests as Intel TDX and serves E2EE traffic normally, but returns the pre-ACI attestation shape, with no `workload_id` and no keyset. That is a missing capability rather than a failure, and it is reported once per model without affecting completions.
 
-Models can also share a workload, in which case they pin to the same anchor, recorded per model so a move by either is still visible. `e2ee-glm-5-2-p` and `e2ee-qwen3-30b-a3b-p` did; the latter started returning 502 from its attestation endpoint and has since left the catalog, so that pairing can no longer be re-checked.
+Models can also share a workload, in which case they pin to the same anchor, recorded per model so a move by either is still visible.
 
 ### The checks
 
@@ -514,20 +514,19 @@ The top-level secp256k1 `signature` over `<request-hash>:<response-hash>` in the
 
 > For agent workloads use the `tee-` prefix rather than `e2ee-`. Function calling over E2EE is best-effort and fails often enough to be unusable for anything chaining tool calls. See [E2EE tool calling is best-effort](#e2ee-tool-calling-is-best-effort).
 
-Pass `tools` and `tool_choice` exactly as with the OpenAI API. Verified end to end against the live API on both paths, catalog last checked 2026-08-28:
+Pass `tools` and `tool_choice` exactly as with the OpenAI API. Verified end to end against the live API on both paths. Venice adds and drops models often, so treat this table as a snapshot and get the current ids from `/models`:
 
 | Model | Tools | Context | Output | $ in / M | $ out / M |
 |---|---|---|---|---|---|
 | `e2ee-glm-5-2-p` | yes | 524288 | 32768 | 1.75 | 5.75 |
 | `e2ee-deepseek-v4-flash` | yes | 1000000 | 8192 | 0.182 | 0.373 |
 | `e2ee-qwen3-6-35b-a3b` | yes | 32000 | 4096 | 0.182 | 1.18 |
-| `e2ee-gemma-4-31b` *(delisted August 2026)* | no | 32000 | 4096 | 0.139 | 0.43 |
 
-Check `supportsFunctionCalling` on `/models` before relying on tools. The two paths disagree about what happens when it is `false`. TEE-only refuses, because `tools` is a real request parameter and Venice rejects it with `400 "tools is not supported by this model"`, so you find out immediately. E2EE appears to work, because schemas travel inside the prompt and Venice's capability check never sees them. `e2ee-gemma-4-31b` emits well-formed `<tool_call>` blocks that this proxy parses into real `tool_calls`, but the model was never trained for the round trip and echoes the `<tool_response>` back instead of answering it.
+Check `supportsFunctionCalling` on `/models` before relying on tools. The two paths disagree about what happens when it is `false`. TEE-only refuses, because `tools` is a real request parameter and Venice rejects it with `400 "tools is not supported by this model"`, so you find out immediately. E2EE appears to work, because schemas travel inside the prompt and Venice's capability check never sees them. A model without native tool support can emit well-formed `<tool_call>` blocks that this proxy parses into real `tool_calls`, and still be useless: never having been trained for the round trip, it echoes the `<tool_response>` back instead of answering it.
 
 So the prompt-based path is not a way to add function calling to models that lack it. It is a way to keep function calling private on models that have it.
 
-(`e2ee-qwen3-vl-30b-a3b-p` also advertises function calling, but Venice's attestation endpoint has been returning 502 for it, unrelated to this proxy. `e2ee-qwen3-30b-a3b-p` had the same problem and is no longer in the catalog.)
+(`e2ee-qwen3-vl-30b-a3b-p` also advertises function calling, but Venice's attestation endpoint returns 502 for it, unrelated to this proxy.)
 
 Venice's E2EE gateway drops the `tools` request parameter, so a request carrying encrypted messages reaches the model with no schemas attached. The same model returns native tool calls when the E2EE headers are absent, so this is a property of the encrypted path rather than the model. Passing `tools` through would have been the worst of both worlds: the model would ignore your tools while their names, descriptions and schemas travelled to Venice in plaintext.
 
