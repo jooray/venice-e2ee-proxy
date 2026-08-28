@@ -66,7 +66,7 @@ check "Missing model returns 400" "400" \
 check "Missing messages returns 400" "400" \
   -X POST "${PROXY_URL}/v1/chat/completions" \
   -H "Content-Type: application/json" \
-  -d '{"model": "e2ee-qwen3-30b-a3b-p"}'
+  -d '{"model": "e2ee-deepseek-v4-flash"}'
 
 # ---- 404 ----
 check "Unknown endpoint returns 404" "404" \
@@ -74,13 +74,13 @@ check "Unknown endpoint returns 404" "404" \
 
 # ---- E2EE streaming request ----
 echo -e "\n${YELLOW}TEST: E2EE streaming request${NC}"
-echo "  Sending streaming request to e2ee-qwen3-30b-a3b-p..."
+echo "  Sending streaming request to e2ee-deepseek-v4-flash..."
 tmpfile=$(mktemp)
 http_code=$(curl -s -o "$tmpfile" -w "%{http_code}" \
   -X POST "${PROXY_URL}/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "e2ee-qwen3-30b-a3b-p",
+    "model": "e2ee-deepseek-v4-flash",
     "messages": [{"role": "user", "content": "Say hello in exactly 3 words."}],
     "stream": true
   }')
@@ -109,13 +109,13 @@ fi
 
 # ---- E2EE non-streaming request ----
 echo -e "\n${YELLOW}TEST: E2EE non-streaming request${NC}"
-echo "  Sending non-streaming request to e2ee-qwen3-30b-a3b-p..."
+echo "  Sending non-streaming request to e2ee-deepseek-v4-flash..."
 tmpfile=$(mktemp)
 http_code=$(curl -s -o "$tmpfile" -w "%{http_code}" \
   -X POST "${PROXY_URL}/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "e2ee-qwen3-30b-a3b-p",
+    "model": "e2ee-deepseek-v4-flash",
     "messages": [{"role": "user", "content": "Say hello in exactly 3 words."}],
     "stream": false
   }')
@@ -150,7 +150,7 @@ for i in $(seq 1 5); do
     -X POST "${PROXY_URL}/v1/chat/completions" \
     -H "Content-Type: application/json" \
     -d "{
-      \"model\": \"e2ee-qwen3-30b-a3b-p\",
+      \"model\": \"e2ee-deepseek-v4-flash\",
       \"messages\": [{\"role\": \"user\", \"content\": \"What is ${i} + ${i}? Reply with just the number.\"}],
       \"stream\": false
     }" > "${tf}.code" 2>/dev/null &
@@ -187,7 +187,7 @@ check "Endpoint without /v1 prefix" "200" \
   -X POST "${PROXY_URL}/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "e2ee-qwen3-30b-a3b-p",
+    "model": "e2ee-deepseek-v4-flash",
     "messages": [{"role": "user", "content": "Say ok"}],
     "stream": false
   }'

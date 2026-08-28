@@ -27,7 +27,7 @@ const server = app.listen(config.port, config.host, () => {
   logger.info('Usage:');
   logger.info(`  curl http://${config.host}:${config.port}/v1/chat/completions \\`);
   logger.info('    -H "Content-Type: application/json" \\');
-  logger.info('    -d \'{"model": "e2ee-qwen3-30b-a3b-p", "messages": [{"role": "user", "content": "Hello!"}]}\'');
+  logger.info('    -d \'{"model": "e2ee-glm-5-2-p", "messages": [{"role": "user", "content": "Hello!"}]}\'');
 });
 
 // Graceful shutdown
