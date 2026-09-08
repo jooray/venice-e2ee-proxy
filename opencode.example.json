@@ -9,57 +9,149 @@
         "apiKey": "unused"
       },
       "models": {
-        "e2ee-glm-5-2-p": {
-          "name": "GLM 5.2 (E2EE)",
+        "e2ee-glm-5-3-p": {
+          "name": "GLM 5.3 (E2EE)",
           "tool_call": true,
           "reasoning": true,
           "attachment": false,
-          "limit": { "context": 524288, "output": 32768 },
-          "cost": { "input": 1.75, "output": 5.75 }
+          "limit": {
+            "context": 1000000,
+            "output": 32768
+          },
+          "cost": {
+            "input": 1.75,
+            "output": 5.5
+          }
+        },
+        "e2ee-glm-5-3-flash": {
+          "name": "GLM 5.3 Flash (E2EE)",
+          "tool_call": true,
+          "reasoning": true,
+          "attachment": false,
+          "limit": {
+            "context": 1000000,
+            "output": 32768
+          },
+          "cost": {
+            "input": 0.16,
+            "output": 0.54
+          }
         },
         "e2ee-deepseek-v4-flash": {
           "name": "DeepSeek V4 Flash (E2EE)",
           "tool_call": true,
           "reasoning": true,
           "attachment": false,
-          "limit": { "context": 1000000, "output": 8192 },
-          "cost": { "input": 0.182, "output": 0.373 }
+          "limit": {
+            "context": 1000000,
+            "output": 8192
+          },
+          "cost": {
+            "input": 0.182,
+            "output": 0.373
+          }
+        },
+        "e2ee-qwen3-8-27b": {
+          "name": "Qwen3.8 27B (E2EE)",
+          "tool_call": true,
+          "reasoning": true,
+          "attachment": false,
+          "limit": {
+            "context": 262144,
+            "output": 8192
+          },
+          "cost": {
+            "input": 0.47,
+            "output": 3.53
+          }
         },
         "e2ee-qwen3-6-35b-a3b": {
-          "name": "Qwen 3.6 35B A3B FP8 (E2EE)",
+          "name": "Qwen3.6 35B A3B (E2EE)",
           "tool_call": true,
           "reasoning": true,
           "attachment": false,
-          "limit": { "context": 32000, "output": 4096 },
-          "cost": { "input": 0.182, "output": 1.18 }
+          "limit": {
+            "context": 32000,
+            "output": 4096
+          },
+          "cost": {
+            "input": 0.182,
+            "output": 1.18
+          }
         },
-        "tee-e2ee-glm-5-2-p": {
-          "name": "GLM 5.2 (TEE)",
+        "tee-e2ee-glm-5-3-p": {
+          "name": "GLM 5.3 (TEE)",
           "tool_call": true,
           "reasoning": true,
           "attachment": false,
-          "limit": { "context": 524288, "output": 32768 },
-          "cost": { "input": 1.75, "output": 5.75 }
+          "limit": {
+            "context": 1000000,
+            "output": 32768
+          },
+          "cost": {
+            "input": 1.75,
+            "output": 5.5
+          }
+        },
+        "tee-e2ee-glm-5-3-flash": {
+          "name": "GLM 5.3 Flash (TEE)",
+          "tool_call": true,
+          "reasoning": true,
+          "attachment": true,
+          "limit": {
+            "context": 1000000,
+            "output": 32768
+          },
+          "cost": {
+            "input": 0.16,
+            "output": 0.54
+          }
         },
         "tee-e2ee-deepseek-v4-flash": {
           "name": "DeepSeek V4 Flash (TEE)",
           "tool_call": true,
           "reasoning": true,
           "attachment": false,
-          "limit": { "context": 1000000, "output": 8192 },
-          "cost": { "input": 0.182, "output": 0.373 }
+          "limit": {
+            "context": 1000000,
+            "output": 8192
+          },
+          "cost": {
+            "input": 0.182,
+            "output": 0.373
+          }
+        },
+        "tee-e2ee-qwen3-8-27b": {
+          "name": "Qwen3.8 27B (TEE)",
+          "tool_call": true,
+          "reasoning": true,
+          "attachment": true,
+          "limit": {
+            "context": 262144,
+            "output": 8192
+          },
+          "cost": {
+            "input": 0.47,
+            "output": 3.53
+          }
         },
         "tee-e2ee-qwen3-6-35b-a3b": {
-          "name": "Qwen 3.6 35B A3B FP8 (TEE)",
+          "name": "Qwen3.6 35B A3B (TEE)",
           "tool_call": true,
           "reasoning": true,
           "attachment": false,
-          "limit": { "context": 32000, "output": 4096 },
-          "cost": { "input": 0.182, "output": 1.18 }
+          "limit": {
+            "context": 32000,
+            "output": 4096
+          },
+          "cost": {
+            "input": 0.182,
+            "output": 1.18
+          }
         }
       }
     }
   },
-  "model": "venice-e2ee/tee-e2ee-glm-5-2-p",
-  "small_model": "venice-e2ee/tee-e2ee-qwen3-6-35b-a3b"
+  "model": "venice-e2ee/tee-e2ee-glm-5-3-p",
+  "small_model": "venice-e2ee/tee-e2ee-glm-5-3-flash"
 }

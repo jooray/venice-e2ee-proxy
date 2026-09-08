@@ -51,7 +51,7 @@ npm run dev
 ```bash
 curl http://127.0.0.1:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "e2ee-glm-5-2-p", "messages": [{"role": "user", "content": "Hello!"}]}'
+  -d '{"model": "e2ee-glm-5-3-p", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
 Node.js 20+ and a [Venice AI](https://venice.ai) API key are required. If you cloned without `--recurse-submodules`, run `git submodule update --init --recursive` first. For production, `npm run build && npm start`.
@@ -134,7 +134,7 @@ The reproducible ones matter most, because they bind the quote to things you can
 `scripts/audit-attestation.py` does all of this and prints what held:
 
 ```
-$ ./scripts/audit-attestation.py --model e2ee-glm-5-2-p
+$ ./scripts/audit-attestation.py --model e2ee-glm-5-3-p
 
 BINDING (recomputed from the quote's REPORTDATA)
   PASS  our nonce is inside the quote
@@ -181,7 +181,7 @@ Prefix the model with `e2ee-` and the proxy handles encryption and decryption:
 ```bash
 curl http://127.0.0.1:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "e2ee-glm-5-2-p", "messages": [{"role": "user", "content": "Hello"}], "stream": true}'
+  -d '{"model": "e2ee-glm-5-3-p", "messages": [{"role": "user", "content": "Hello"}], "stream": true}'
 ```
 
 Streaming and non-streaming both work; non-streaming is the default, as in the OpenAI API. Reasoning models also return decrypted `reasoning_content`, as a delta field when streaming and on the message when not.
@@ -195,7 +195,7 @@ Venice exposes one model ID for two request flows. The model runs inside an atte
 ```bash
 curl http://127.0.0.1:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "tee-e2ee-glm-5-2-p", "messages": [{"role": "user", "content": "Weather in Bratislava?"}],
+  -d '{"model": "tee-e2ee-glm-5-3-p", "messages": [{"role": "user", "content": "Weather in Bratislava?"}],
        "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {
          "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]}'
 ```
@@ -516,19 +516,22 @@ The top-level secp256k1 `signature` over `<request-hash>:<response-hash>` in the
 
 Pass `tools` and `tool_choice` exactly as with the OpenAI API. Verified end to end against the live API on both paths. Venice adds and drops models often, so treat this table as a snapshot and get the current ids from `/models`:
 
-| Model | Tools | Context | Output | $ in / M | $ out / M |
-|---|---|---|---|---|---|
-| `e2ee-glm-5-2-p` | yes | 524288 | 32768 | 1.75 | 5.75 |
-| `e2ee-deepseek-v4-flash` | yes | 1000000 | 8192 | 0.182 | 0.373 |
-| `e2ee-qwen3-6-35b-a3b` | yes | 32000 | 4096 | 0.182 | 1.18 |
+| Model | Tools | Vision | Context | Output | $ in / M | $ out / M |
+|---|---|---|---|---|---|---|
+| `e2ee-glm-5-3-p` | yes | no | 1000000 | 32768 | 1.75 | 5.5 |
+| `e2ee-glm-5-3-flash` | yes | yes | 1000000 | 32768 | 0.16 | 0.54 |
+| `e2ee-glm-5-2-p` | yes | no | 524288 | 32768 | 1.75 | 5.75 |
+| `e2ee-deepseek-v4-flash` | yes | no | 1000000 | 8192 | 0.182 | 0.373 |
+| `e2ee-qwen3-8-27b` | yes | yes | 262144 | 8192 | 0.47 | 3.53 |
+| `e2ee-qwen3-6-35b-a3b` | yes | no | 32000 | 4096 | 0.182 | 1.18 |
 
 Check `supportsFunctionCalling` on `/models` before relying on tools. The two paths disagree about what happens when it is `false`. TEE-only refuses, because `tools` is a real request parameter and Venice rejects it with `400 "tools is not supported by this model"`, so you find out immediately. E2EE appears to work, because schemas travel inside the prompt and Venice's capability check never sees them. A model without native tool support can emit well-formed `<tool_call>` blocks that this proxy parses into real `tool_calls`, and still be useless: never having been trained for the round trip, it echoes the `<tool_response>` back instead of answering it.
 
 So the prompt-based path is not a way to add function calling to models that lack it. It is a way to keep function calling private on models that have it.
 
-(`e2ee-qwen3-vl-30b-a3b-p` also advertises function calling, but Venice's attestation endpoint returns 502 for it, unrelated to this proxy.)
+Two more advertise function calling and are still not usable, each for its own reason, both upstream of this proxy. `e2ee-kimi-k2-6` fails at the door: `/tee/attestation` returns 502, so no session can be established on either path. `e2ee-qwen3-vl-30b-a3b-p` attests fine and then refuses the tools themselves — Venice's backend answers `400 "auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set`, a vLLM that was started without tool parsing. Re-probe both before adding them; neither failure is anything a client can work around.
 
-Venice's E2EE gateway drops the `tools` request parameter, so a request carrying encrypted messages reaches the model with no schemas attached. The same model returns native tool calls when the E2EE headers are absent, so this is a property of the encrypted path rather than the model. Passing `tools` through would have been the worst of both worlds: the model would ignore your tools while their names, descriptions and schemas travelled to Venice in plaintext.
+Venice's E2EE gateway drops the `tools` request parameter, so a request carrying encrypted messages reaches the model with no schemas attached. The same model returns native tool calls when the E2EE headers are absent, so this is a property of the encrypted path rather than the model. Venice's own documentation now says as much — its E2EE limitations table lists `Function calling: Not supported`, alongside web search, file uploads and the Venice system prompt. Nothing rejects the parameter, though: the request returns `200` and the model answers that it has no tools, so a client that passes `tools` gets prose instead of an error. Passing `tools` through would have been the worst of both worlds: the model would ignore your tools while their names, descriptions and schemas travelled to Venice in plaintext.
 
 So the proxy moves function calling inside the encrypted channel. Schemas are rendered into a system message and encrypted with the rest of the conversation. The model's `<tool_call>` blocks are parsed out of the decrypted stream and converted back into OpenAI `tool_calls`. Prior `tool_calls` and `tool` results in your history are folded into encrypted message content, and the plaintext `tool_calls` field is dropped before the request leaves. The test suite asserts that none of them reach the wire.
 
@@ -595,7 +598,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:3000/v1", api_key="unused")
 response = client.chat.completions.create(
-    model="e2ee-glm-5-2-p",
+    model="e2ee-glm-5-3-p",
     messages=[{"role": "user", "content": "Hello!"}],
 )
 print(response.choices[0].message.content)
@@ -618,21 +621,23 @@ Concurrent requests are safe. Sessions are cached per model and shared, since en
       "name": "Venice E2EE Proxy",
       "options": { "baseURL": "http://127.0.0.1:5656/v1", "apiKey": "unused" },
       "models": {
-        "tee-e2ee-glm-5-2-p": {
-          "name": "GLM 5.2 (TEE)",
+        "tee-e2ee-glm-5-3-p": {
+          "name": "GLM 5.3 (TEE)",
           "tool_call": true, "reasoning": true, "attachment": false,
-          "limit": { "context": 524288, "output": 32768 },
-          "cost": { "input": 1.75, "output": 5.75 }
+          "limit": { "context": 1000000, "output": 32768 },
+          "cost": { "input": 1.75, "output": 5.5 }
         }
       }
     }
   },
-  "model": "venice-e2ee/tee-e2ee-glm-5-2-p",
-  "small_model": "venice-e2ee/tee-e2ee-qwen3-6-35b-a3b"
+  "model": "venice-e2ee/tee-e2ee-glm-5-3-p",
+  "small_model": "venice-e2ee/tee-e2ee-glm-5-3-flash"
 }
 ```
 
-[`opencode.example.json`](opencode.example.json) has the full list: the three models with `supportsFunctionCalling: true` that also pass a live attestation probe, each in both `tee-` and `e2ee-` form. The `tee-` variants are the defaults because Venice's native function calling works on that path, while the `e2ee-` path's prompt-based parsing is best-effort. The `e2ee-` entries stay selectable for non-tool or maximum-privacy turns.
+[`opencode.example.json`](opencode.example.json) has the list worth offering in a picker, each in both `tee-` and `e2ee-` form: the models above, minus any that a sibling strictly dominates. `e2ee-glm-5-2-p` is the one left out — GLM 5.3 matches its input price with cheaper output and twice the context, so nothing would ever select it. It still works, which is why it stays in the table. The `tee-` variants are the defaults because Venice's native function calling works on that path, while the `e2ee-` path's prompt-based parsing is best-effort. The `e2ee-` entries stay selectable for non-tool or maximum-privacy turns.
+
+`attachment` is set on the `tee-` entries of the vision models only. An image is a non-text content part, and the E2EE path encrypts text: `flattenMessageContent` throws `Unsupported message content part "image_url"` rather than quietly dropping the picture. So vision works on `tee-`, and an `e2ee-` request carrying an image fails loudly, which is the intended trade.
 
 ## Testing and development
 

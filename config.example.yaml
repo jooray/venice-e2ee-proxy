@@ -177,11 +177,15 @@ log_level: "info"
 # Not every E2EE model supports tools. Verified working with function calling
 # over E2EE, but Venice adds and drops models often, so check the live list
 # rather than trusting these ids:
-#   e2ee-glm-5-2-p        524K ctx  32K out  $1.75/$5.75 per M tokens
+#   e2ee-glm-5-3-p         1M ctx  32K out  $1.75/$5.5 per M tokens
+#   e2ee-glm-5-3-flash     1M ctx  32K out  $0.16/$0.54  (vision)
+#   e2ee-glm-5-2-p        524K ctx 32K out  $1.75/$5.75
 #   e2ee-deepseek-v4-flash 1M ctx   8K out  $0.182/$0.373
-#   e2ee-qwen3-6-35b-a3b   32K ctx   4K out  $0.182/$1.18
-# e2ee-qwen3-vl-30b-a3b-p advertises FC but the attestation endpoint 502s —
-# re-probe before adding.
+#   e2ee-qwen3-8-27b      262K ctx  8K out  $0.47/$3.53   (vision)
+#   e2ee-qwen3-6-35b-a3b   32K ctx  4K out  $0.182/$1.18
+# Two more advertise FC and still don't work: e2ee-kimi-k2-6 502s on the
+# attestation endpoint, and e2ee-qwen3-vl-30b-a3b-p attests but rejects tools
+# ("--enable-auto-tool-choice ... to be set"). Re-probe before adding either.
 # Check the current list:
 #   curl -H "Authorization: Bearer $VENICE_API_KEY" \
 #     "https://api.venice.ai/api/v1/models?type=text"
