@@ -107,6 +107,20 @@
             "output": 0.54
           }
         },
+        "tee-e2ee-kimi-k3-p": {
+          "name": "Kimi K3 (TEE, needs verify_gpu_attestation: false)",
+          "tool_call": true,
+          "reasoning": true,
+          "attachment": true,
+          "limit": {
+            "context": 1000000,
+            "output": 131072
+          },
+          "cost": {
+            "input": 3.75,
+            "output": 18.75
+          }
+        },
         "tee-e2ee-deepseek-v4-flash": {
           "name": "DeepSeek V4 Flash (TEE)",
           "tool_call": true,

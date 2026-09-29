@@ -181,6 +181,14 @@ log_level: "info"
 #   e2ee-glm-5-3-flash     1M ctx  32K out  $0.16/$0.54  (vision)
 #   e2ee-glm-5-2-p        524K ctx 32K out  $1.75/$5.75
 #   e2ee-deepseek-v4-flash 1M ctx   8K out  $0.182/$0.373
+#   e2ee-kimi-k3-p         1M ctx 131K out  $3.75/$18.75  (vision) -- see below
+# Kimi K3 serves no GPU evidence at all (the attestation says so outright:
+# gpu_evidence_omitted: true), so it needs verify_gpu_attestation: false to run
+# at all -- and that flag is global, dropping the check for every other model in
+# the process too. Its e2ee- path also 400s on any tool-role message, so use
+# tee-e2ee-kimi-k3-p for tools. Both are in the README.
+# These two answered when added and have since stopped: their nodes fail DCAP
+# with "unacceptable TCB status OutOfDate", which only a node update fixes.
 #   e2ee-qwen3-8-27b      262K ctx  8K out  $0.47/$3.53   (vision)
 #   e2ee-qwen3-6-35b-a3b   32K ctx  4K out  $0.182/$1.18
 # Two more advertise FC and still don't work: e2ee-kimi-k2-6 502s on the
