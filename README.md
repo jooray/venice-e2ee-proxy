@@ -2,6 +2,22 @@
 
 A local proxy that encrypts [OpenAI-compatible](https://platform.openai.com/docs/api-reference/chat) API requests using [Venice AI's](https://venice.ai) end-to-end encryption protocol.
 
+<!-- jooray-links:start -->
+### More from me
+
+**Related projects**
+
+- [venice-frontend](https://github.com/jooray/venice-frontend): alternative Venice.ai front-end for image, video and chat
+- [venice-image](https://github.com/jooray/venice-image): generate images with the Venice API from the command line
+- [video-summarizer](https://github.com/jooray/video-summarizer): summarize video transcripts with the Venice API
+- [hermes-venice-model-switcher](https://github.com/jooray/hermes-venice-model-switcher): DIEM-aware model switcher for Hermes Agent on Venice
+- [hermes-firewall](https://github.com/jooray/hermes-firewall): prompt-injection gate for Hermes Agent
+
+**Full project showcase:** [Venice E2EE Proxy in my project showcase](https://juraj.bednar.io/showcase/#AI-08), or [all my projects](https://juraj.bednar.io/showcase/).
+
+I write about building things on [my blog](https://juraj.bednar.io/en/blog-en/). I also wrote a cypherpunk novel, [Tamers of Entropy](https://tamersofentropy.net/), and there is a [trailer](https://tamersofentropy.net/#trailer).
+<!-- jooray-links:end -->
+
 Prompts are encrypted on your machine and decrypted inside an attested Intel TDX enclave. Venice's own infrastructure never holds the plaintext. What the enclave then does with it is worth understanding before you rely on that: see [what is actually attested](#what-is-actually-attested).
 
 ## How it works
