@@ -8,6 +8,7 @@ import {
 } from './session-manager.js';
 import { logger } from './logger.js';
 import { debugDump } from './debug-dump.js';
+import { mergeSystemMessages } from './messages.js';
 import {
   buildToolSystemPrompt,
   renderToolMessages,
@@ -597,15 +598,15 @@ export class ProxyHandler {
       const { tools, tool_choice, parallel_tool_calls, ...restBody } = body as ChatCompletionRequest;
       const toolPrompt = tools?.length ? buildToolSystemPrompt(tools, tool_choice ?? 'auto') : null;
 
-      let messages = renderToolMessages(body.messages);
+      // Venice joins multiple system messages on the ciphertext and then rejects
+      // the result, so they become one here, in plaintext. The tool schemas join
+      // that same message, so models that only honour one system turn see them.
+      const rendered = renderToolMessages(body.messages);
+      const messages = mergeSystemMessages(rendered, toolPrompt);
+      if (messages.length < rendered.length) {
+        logger.debug(`Merged ${rendered.length - messages.length + 1} system messages into one before encryption`);
+      }
       if (toolPrompt) {
-        // Merge into an existing leading system message so models that only honour
-        // the first system turn still see the schemas.
-        if (messages[0]?.role === 'system') {
-          messages = [{ ...messages[0], content: `${messages[0].content}\n\n${toolPrompt}` }, ...messages.slice(1)];
-        } else {
-          messages = [{ role: 'system', content: toolPrompt }, ...messages];
-        }
         logger.debug(`Injected ${tools!.length} tool schema(s) into the encrypted prompt`);
         warnAboutE2EEToolCalling(modelId);
       }

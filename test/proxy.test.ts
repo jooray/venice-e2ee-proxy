@@ -5,7 +5,7 @@ import type { Express } from 'express';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { generateKeypair, deriveAESKey, encryptMessage } from 'venice-e2ee';
+import { generateKeypair, deriveAESKey, encryptMessage, decryptChunk } from 'venice-e2ee';
 
 // Generate a valid secp256k1 keypair for the mock TEE
 const mockTeeKeypair = generateKeypair();
@@ -651,6 +651,49 @@ describe('E2EE function calling', () => {
     expect(lastReceivedBody.messages.some((m: any) => m.role === 'tool')).toBe(true);
 
     expect(JSON.parse(res.body).choices[0].message.content).toBe('It is raining.');
+  });
+
+  it('sends a single encrypted system message when the client sends several', async () => {
+    responseChunks = ['ok'];
+    const res = await request(proxyServer, 'POST', '/v1/chat/completions', {
+      model: 'e2ee-glm-5-2-p',
+      messages: [
+        { role: 'system', content: 'First system.' },
+        { role: 'system', content: [{ type: 'text', text: 'Second system.' }] },
+        { role: 'user', content: 'Hello' },
+        { role: 'assistant', content: 'Hi' },
+        { role: 'system', content: 'Third system.' },
+        { role: 'user', content: 'Again' },
+      ],
+    });
+
+    expect(res.status).toBe(200);
+    const sent = lastReceivedBody.messages;
+    expect(sent.map((m: any) => m.role)).toEqual(['system', 'user', 'assistant', 'user']);
+    // Venice joins system messages on the ciphertext; each field must stay one
+    // well-formed encrypted blob, which only holds if there is a single one.
+    for (const msg of sent) expect(msg.content).toMatch(/^[0-9a-f]+$/);
+    const system = await decryptChunk(mockTeeKeypair.privateKey, sent[0].content);
+    expect(system).toBe('First system.\n\nSecond system.\n\nThird system.');
+  });
+
+  it('puts the tool schemas into the single merged system message', async () => {
+    responseChunks = ['ok'];
+    await request(proxyServer, 'POST', '/v1/chat/completions', {
+      model: 'e2ee-glm-5-2-p',
+      messages: [
+        { role: 'system', content: 'First system.' },
+        { role: 'system', content: 'Second system.' },
+        { role: 'user', content: 'Weather?' },
+      ],
+      tools: [weatherTool],
+    });
+
+    const sent = lastReceivedBody.messages;
+    expect(sent.filter((m: any) => m.role === 'system')).toHaveLength(1);
+    const system = await decryptChunk(mockTeeKeypair.privateKey, sent[0].content);
+    expect(system.startsWith('First system.\n\nSecond system.\n\n')).toBe(true);
+    expect(system).toContain('get_weather');
   });
 
   it('does not offer tools when tool_choice is none', async () => {
