@@ -148,14 +148,16 @@ log_level: "info"
 # ------
 # There is no model setting here — the model comes from each request, so any
 # Venice model works without configuration. Prefix a model with `e2ee-` to get
-# the encrypted path; anything else is forwarded to Venice untouched.
+# the encrypted path, or `tee-` for attested plaintext; anything else is
+# forwarded to Venice untouched.
 #
-# Example request against the GLM model, which supports function calling:
+# Example request against GLM 5.3 Flash, which supports function calling and
+# serves GPU evidence, so it runs with the default settings above:
 #
 #   curl http://127.0.0.1:3000/v1/chat/completions \
 #     -H "Content-Type: application/json" \
 #     -d '{
-#       "model": "e2ee-glm-5-2-p",
+#       "model": "e2ee-glm-5-3-flash",
 #       "messages": [{"role": "user", "content": "What is the weather in Bratislava?"}],
 #       "tools": [{
 #         "type": "function",
@@ -172,28 +174,30 @@ log_level: "info"
 #     }'
 #
 # Tool schemas and arguments are encrypted along with the conversation — see the
-# Function Calling section of the README.
+# Function Calling section of the README. Multiple system messages are merged
+# into one before encryption, because Venice's E2EE path accepts only one.
 #
-# Not every E2EE model supports tools. Verified working with function calling
-# over E2EE, but Venice adds and drops models often, so check the live list
-# rather than trusting these ids:
-#   e2ee-glm-5-3-p         1M ctx  32K out  $1.75/$5.5 per M tokens
-#   e2ee-glm-5-3-flash     1M ctx  32K out  $0.16/$0.54  (vision)
-#   e2ee-glm-5-2-p        524K ctx 32K out  $1.75/$5.75
+# With verify_gpu_attestation: true (the default) a model works only if Venice
+# serves GPU evidence for it. Venice adds and drops models, and evidence, often,
+# so check before relying on an id:
+#   python3 scripts/audit-gpu-evidence.py
+#
+# Function calling and GPU evidence, as probed on 2026-11-12:
+#   e2ee-deepseek-v4-1-flash-1017-abliterated  1M ctx 131K out $0.375/$1.5
 #   e2ee-deepseek-v4-flash 1M ctx   8K out  $0.182/$0.373
-#   e2ee-kimi-k3-p         1M ctx 131K out  $3.75/$18.75  (vision) -- see below
-# Kimi K3 serves no GPU evidence at all (the attestation says so outright:
-# gpu_evidence_omitted: true), so it needs verify_gpu_attestation: false to run
-# at all -- and that flag is global, dropping the check for every other model in
-# the process too. Its e2ee- path also 400s on any tool-role message, so use
-# tee-e2ee-kimi-k3-p for tools. Both are in the README.
-# These two answered when added and have since stopped: their nodes fail DCAP
-# with "unacceptable TCB status OutOfDate", which only a node update fixes.
-#   e2ee-qwen3-8-27b      262K ctx  8K out  $0.47/$3.53   (vision)
+#   e2ee-glm-5-3-flash     1M ctx  32K out  $0.16/$0.54  (vision)
+#   e2ee-qwen3-8-27b      262K ctx  8K out  $0.47/$3.53  (vision)
 #   e2ee-qwen3-6-35b-a3b   32K ctx  4K out  $0.182/$1.18
-# Two more advertise FC and still don't work: e2ee-kimi-k2-6 502s on the
-# attestation endpoint, and e2ee-qwen3-vl-30b-a3b-p attests but rejects tools
-# ("--enable-auto-tool-choice ... to be set"). Re-probe before adding either.
+# GPU evidence depends on the node, so some sessions are refused:
+#   e2ee-glm-5-3-p         1M ctx  32K out  $1.75/$5.5
+# No GPU evidence (gpu_evidence_omitted: true), refused unless you set
+# verify_gpu_attestation: false. That flag is global and leaves the GPU vouched
+# for by Venice alone, for every model in the process; see the README:
+#   e2ee-glm-5-2-p        524K ctx 32K out  $1.75/$5.75
+#   e2ee-gpt-oss-120b-p    (no function calling)
+# Attestation endpoint returns 502, so no session at all:
+#   e2ee-kimi-k3-p (also 400s on tool-role messages over e2ee-; use tee- for
+#   tools when it is back), e2ee-kimi-k2-6
 # Check the current list:
 #   curl -H "Authorization: Bearer $VENICE_API_KEY" \
 #     "https://api.venice.ai/api/v1/models?type=text"

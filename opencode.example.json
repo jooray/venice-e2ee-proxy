@@ -10,7 +10,7 @@
       },
       "models": {
         "e2ee-glm-5-3-p": {
-          "name": "GLM 5.3 (E2EE)",
+          "name": "GLM 5.3 (E2EE, GPU evidence varies by node)",
           "tool_call": true,
           "reasoning": true,
           "attachment": false,
@@ -51,6 +51,20 @@
             "output": 0.373
           }
         },
+        "e2ee-deepseek-v4-1-flash-1017-abliterated": {
+          "name": "DeepSeek V4.1 Flash Abliterated (E2EE)",
+          "tool_call": true,
+          "reasoning": true,
+          "attachment": false,
+          "limit": {
+            "context": 1000000,
+            "output": 131072
+          },
+          "cost": {
+            "input": 0.375,
+            "output": 1.5
+          }
+        },
         "e2ee-qwen3-8-27b": {
           "name": "Qwen3.8 27B (E2EE)",
           "tool_call": true,
@@ -80,7 +94,7 @@
           }
         },
         "tee-e2ee-glm-5-3-p": {
-          "name": "GLM 5.3 (TEE)",
+          "name": "GLM 5.3 (TEE, GPU evidence varies by node)",
           "tool_call": true,
           "reasoning": true,
           "attachment": false,
@@ -135,6 +149,20 @@
             "output": 0.373
           }
         },
+        "tee-e2ee-deepseek-v4-1-flash-1017-abliterated": {
+          "name": "DeepSeek V4.1 Flash Abliterated (TEE)",
+          "tool_call": true,
+          "reasoning": true,
+          "attachment": false,
+          "limit": {
+            "context": 1000000,
+            "output": 131072
+          },
+          "cost": {
+            "input": 0.375,
+            "output": 1.5
+          }
+        },
         "tee-e2ee-qwen3-8-27b": {
           "name": "Qwen3.8 27B (TEE)",
           "tool_call": true,
@@ -166,6 +194,6 @@
       }
     }
   },
-  "model": "venice-e2ee/tee-e2ee-glm-5-3-p",
+  "model": "venice-e2ee/tee-e2ee-glm-5-3-flash",
   "small_model": "venice-e2ee/tee-e2ee-glm-5-3-flash"
 }

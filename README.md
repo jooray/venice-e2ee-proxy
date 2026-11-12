@@ -67,7 +67,7 @@ npm run dev
 ```bash
 curl http://127.0.0.1:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "e2ee-glm-5-3-p", "messages": [{"role": "user", "content": "Hello!"}]}'
+  -d '{"model": "e2ee-glm-5-3-flash", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
 Node.js 20+ and a [Venice AI](https://venice.ai) API key are required. If you cloned without `--recurse-submodules`, run `git submodule update --init --recursive` first. For production, `npm run build && npm start`.
@@ -150,7 +150,7 @@ The reproducible ones matter most, because they bind the quote to things you can
 `scripts/audit-attestation.py` does all of this and prints what held:
 
 ```
-$ ./scripts/audit-attestation.py --model e2ee-glm-5-3-p
+$ ./scripts/audit-attestation.py --model e2ee-glm-5-3-flash
 
 BINDING (recomputed from the quote's REPORTDATA)
   PASS  our nonce is inside the quote
@@ -197,12 +197,22 @@ Prefix the model with `e2ee-` and the proxy handles encryption and decryption:
 ```bash
 curl http://127.0.0.1:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "e2ee-glm-5-3-p", "messages": [{"role": "user", "content": "Hello"}], "stream": true}'
+  -d '{"model": "e2ee-glm-5-3-flash", "messages": [{"role": "user", "content": "Hello"}], "stream": true}'
 ```
 
 Streaming and non-streaming both work; non-streaming is the default, as in the OpenAI API. Reasoning models also return decrypted `reasoning_content`, as a delta field when streaming and on the message when not.
 
 Models without the `e2ee-` prefix are forwarded to Venice untouched, with only the authorization header added.
+
+A response that cannot be decrypted, an event that is not valid JSON, or a stream that ends without `[DONE]` is reported as an error rather than returned as a shorter `200`. When the failure arrives after a stream has started, the stream ends with an OpenAI-style `error` event and no `[DONE]`, so a client can tell a broken answer from a finished one. That still does not make the stream tamper-evident: each chunk is encrypted on its own, so Venice could drop or reorder chunks without the proxy noticing. Closing that gap needs a protocol change on Venice's side.
+
+### System messages
+
+Venice's E2EE path accepts at most one system message per request. A second one anywhere in the conversation, adjacent or not, makes the request fail: Venice joins the system contents on the ciphertext, and the joined string is no longer one encrypted field. Depending on the model you get `Encrypted field is not valid hex` or `E2EE decryption failed`. opencode, SillyTavern and other clients send several system messages by default.
+
+So the proxy merges them before encrypting. Every `system` message is flattened to text (content-part arrays included), the texts are joined with a blank line, and the result replaces the first system message, in plaintext, before anything is encrypted. The other system messages are removed. When the request carries `tools`, the rendered tool schemas are appended to that same message. Repeated `user`, `assistant` and `tool` turns are accepted by Venice as they are, so they keep their roles and positions. A request with a single system message and no tools is sent unchanged.
+
+The visible effect is that a system message placed late in the conversation, such as a SillyTavern author's note, moves up to where the first one was. The model still reads its text, just earlier in the context. `tee-` requests are not encrypted and are forwarded as sent.
 
 ### TEE-only models
 
@@ -211,7 +221,7 @@ Venice exposes one model ID for two request flows. The model runs inside an atte
 ```bash
 curl http://127.0.0.1:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "tee-e2ee-glm-5-3-p", "messages": [{"role": "user", "content": "Weather in Bratislava?"}],
+  -d '{"model": "tee-e2ee-glm-5-3-flash", "messages": [{"role": "user", "content": "Weather in Bratislava?"}],
        "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {
          "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]}'
 ```
@@ -364,28 +374,48 @@ e2ee-glm-5-2-p         98158 B    8      HOPPER   GH100 x8, all passing, eat_non
 
 That used to cost nothing. On the sweep this section was written from, every E2EE model that answered carried GPU evidence, 13 of 13, and the three that did not answer were already failing plain `verify_attestation`.
 
-`e2ee-kimi-k3-p` is the first model where the gate is the only thing standing between you and a working session. Its Intel side is in good order — nonce bound, signing key bound, not in debug mode, `MRCONFIGID` reproducing from the compose manifest — and it serves no `nvidia_payload` at all. Venice says so itself rather than leaving you to notice: the attestation carries `gpu_evidence_omitted: true`. Repeated probes return the same thing, including across different backing instances, so it is how the model is served and not a node having a bad minute.
+It no longer holds. Kimi K3 was the first model to arrive without GPU evidence, and on 2026-11-06 `e2ee-glm-5-3-p`, `e2ee-glm-5-2-p` and `e2ee-gpt-oss-120b-p` followed, where GLM 5.2 had served 8 Hopper GPUs. Their Intel side is in good order — nonce bound, signing key bound, not in debug mode — and they serve no `nvidia_payload` at all. Venice says so itself rather than leaving you to notice: the attestation carries `gpu_evidence_omitted: true`.
 
 The proxy fails closed on both paths:
 
 ```
-$ curl ... -d '{"model": "tee-e2ee-kimi-k3-p", ...}'
+$ curl ... -d '{"model": "tee-e2ee-glm-5-2-p", ...}'
 TEE proxy error: TEE attestation verification failed:
   - GPU attestation is required but the response carried no GPU evidence
 ```
 
-which is the correct behaviour and also, here, the whole decision. Running Kimi K3 means setting `verify_gpu_attestation: false`, and that setting is global — it drops the GPU check for every model in the process, including the ones that would have passed it. There is no per-model override. If you want K3 alongside a gated default, run a second proxy on another port with the gate off and point only that model at it.
-
-What you give up is bounded but real. The Intel TDX attestation still holds, so the gateway is still attested and your prompt still reaches it encrypted. What goes unverified is the second hop: the GPU that actually runs the model is vouched for by nobody, not even by the weak self-reported `nvidia.valid` boolean, because there is no GPU evidence to report on. For a model advertising 1M context at $3.75/$18.75 that may still be the trade you want. Make it deliberately.
+That is the gate doing its job. A missing payload is treated exactly like a failed one, so a node cannot get past the check by leaving its evidence out. There is no per-model exception and no fallback to Venice's own `nvidia.valid` verdict.
 
 Cost is one NRAS round trip per session, measured at roughly nothing next to the 1.7s attestation handshake, and once per session rather than per request. `NRAS_URL` points it at your own verifier instead.
 
-To look at the evidence without enabling the gate:
+### Choosing a model that serves GPU evidence
+
+Which models serve evidence is Venice's decision, and it changes from week to week. The state on 2026-11-12, from `scripts/audit-gpu-evidence.py`:
+
+| GPU evidence | Models |
+|---|---|
+| served, works with the default config | `e2ee-deepseek-v4-flash`, `e2ee-deepseek-v4-1-flash-1017-abliterated`, `e2ee-glm-5-3-flash`, `e2ee-qwen3-8-27b`, `e2ee-qwen3-6-35b-a3b`, `e2ee-qwen3-vl-30b-a3b-p`, `e2ee-qwen-2-5-7b-p` |
+| depends on the node | `e2ee-glm-5-3-p`: 7 of 8 probes carried evidence, one did not |
+| omitted, refused by default | `e2ee-glm-5-2-p`, `e2ee-gpt-oss-120b-p`, `e2ee-gemma-4-26b-a4b-uncensored-p` |
+| attestation endpoint returns 502, no session at all | `e2ee-kimi-k3-p`, `e2ee-kimi-k2-6` |
+
+A model in the second row works for one session and fails the next, depending on which backing instance answered the attestation. The proxy does not retry GPU attestation failures on its own, because most of them repeat exactly, so the failed request comes back to your client and the next request starts a fresh handshake, which may land on a node that serves evidence. For anything unattended, prefer the first row. Under the default config, `e2ee-glm-5-3-flash` is the GLM to use.
+
+Check a model before relying on it, and run the check a few times, since one probe sees one node:
 
 ```bash
-python3 scripts/audit-gpu-evidence.py            # is there GPU evidence?
-python3 scripts/audit-gpu-evidence.py --nras     # verify it with NVIDIA
+python3 scripts/audit-gpu-evidence.py --model e2ee-glm-5-3-flash          # is evidence served?
+python3 scripts/audit-gpu-evidence.py --model e2ee-glm-5-3-flash --nras   # and does NVIDIA accept it?
+python3 scripts/audit-gpu-evidence.py                                     # every e2ee- model
 ```
+
+Neither command needs the gate to be on. If the model you want is in the third row, the choice is between a different model and turning the gate off.
+
+### The risk of `verify_gpu_attestation: false`
+
+With the gate off, those models run, tools included. What you give up is bounded but real. The Intel TDX attestation still holds, so the gateway is still attested and your prompt still reaches it encrypted. What goes unverified is the second hop, where your prompt is decrypted and processed: nobody independent confirms that the GPU running the model is a genuine NVIDIA part in confidential-computing mode with secure boot on and debug off, rather than hardware the host can read. Venice alone vouches for it, which is the thing this proxy otherwise exists to avoid. For models that omit evidence there is not even Venice's weak self-reported `nvidia.valid` boolean, because there is nothing to report on.
+
+The setting is also global. It drops the GPU check for every model in the process, including the ones that would have passed it, and nothing in the logs tells you which sessions would have failed. If you want one of these models alongside a gated default, run a second proxy on another port with the gate off and point only that model at it. For a model advertising 1M context, as GLM 5.3 and Kimi K3 do, that may still be the trade you want. Make it deliberately.
 
 ### NVIDIA token signatures
 
@@ -548,39 +578,43 @@ Pass `tools` and `tool_choice` exactly as with the OpenAI API. Verified end to e
 
 | Model | Tools | Vision | Context | Output | $ in / M | $ out / M |
 |---|---|---|---|---|---|---|
-| `e2ee-glm-5-3-p` | yes | no | 1000000 | 32768 | 1.75 | 5.5 |
-| `e2ee-glm-5-3-flash` | yes | yes | 1000000 | 32768 | 0.16 | 0.54 |
-| `e2ee-glm-5-2-p` | yes | no | 524288 | 32768 | 1.75 | 5.75 |
+| `e2ee-deepseek-v4-1-flash-1017-abliterated` | yes | no | 1000000 | 131072 | 0.375 | 1.5 |
 | `e2ee-deepseek-v4-flash` | yes | no | 1000000 | 8192 | 0.182 | 0.373 |
+| `e2ee-glm-5-3-flash` | yes | yes | 1000000 | 32768 | 0.16 | 0.54 |
+| `e2ee-glm-5-3-p` § | yes | no | 1000000 | 32768 | 1.75 | 5.5 |
+| `e2ee-glm-5-2-p` § | yes | no | 524288 | 32768 | 1.75 | 5.75 |
+| `e2ee-qwen3-8-27b` | yes | yes | 262144 | 8192 | 0.47 | 3.53 |
+| `e2ee-qwen3-6-35b-a3b` | yes | no | 32000 | 4096 | 0.182 | 1.18 |
+| `e2ee-qwen3-vl-30b-a3b-p` | yes | yes | 128000 | 4096 | 0.25 | 0.9 |
 | `e2ee-kimi-k3-p` † | tee only | yes | 1000000 | 131072 | 3.75 | 18.75 |
-| `e2ee-qwen3-8-27b` ‡ | yes | yes | 262144 | 8192 | 0.47 | 3.53 |
-| `e2ee-qwen3-6-35b-a3b` ‡ | yes | no | 32000 | 4096 | 0.182 | 1.18 |
+
+Last re-probed 2026-11-06: each row above completed a full tool round trip (call, tool result, answer) through the proxy on the `e2ee-` path, except where marked. The two DeepSeek models also did it on `tee-`, as did `tee-e2ee-glm-5-3-p`.
+
+`e2ee-deepseek-v4-1-flash-1017-abliterated` is the new DeepSeek: same 1M context as `v4-flash` but 131K output rather than 8K, at about twice the price. It attests with full GPU evidence, so it runs under the default settings.
+
+§ The `-p` GLM models do not reliably serve GPU evidence. `e2ee-glm-5-2-p` omits it entirely (`gpu_evidence_omitted: true`, where it used to carry 8 Hopper GPUs), so with the default `verify_gpu_attestation: true` the proxy refuses it (`GPU attestation is required but the response carried no GPU evidence`) on both `e2ee-` and `tee-`. `e2ee-glm-5-3-p` depends on the node: on 2026-11-12 most attestations carried evidence and some did not, so expect occasional refused sessions. With the gate off both work, including tools, but that setting is global, see [Choosing a model that serves GPU evidence](#choosing-a-model-that-serves-gpu-evidence). `e2ee-glm-5-3-flash`, which does carry evidence, is the GLM to use under the default config. On the `e2ee-` path, GLM 5.3-p answered one tool request with prose ("I'll check the weather") instead of a call, which is the best-effort behaviour described [below](#e2ee-tool-calling-is-best-effort).
 
 † Kimi K3 needs `verify_gpu_attestation: false` to run at all, and its `e2ee-`
-path cannot carry a tool result. Both are covered below. It is the only entry
-here that costs you a verification step to use, and the only one priced like it
-— 1M context and 131K output, at roughly double the output price of anything
-else on the list.
+path cannot carry a tool result. Both are covered below. On the 2026-11-06 and
+2026-11-12 probes its attestation endpoint returned 502 on every attempt, for
+both paths, so no session could be established and it could not be re-verified. It is the only entry here that costs you a
+verification step to use, and the only one priced like it.
 
-‡ Both Qwen entries answered a chat request when they were added and stopped
-between then and this writing: their nodes now fail DCAP with `unacceptable TCB
-status OutOfDate`, so the proxy refuses the session. Nothing about the model
-changed and nothing here can fix it — the node needs a TCB update. Sibling
-models on the same `near-ai` provider (`e2ee-glm-5-3-flash`,
-`e2ee-deepseek-v4-flash`) still pass, so this is per-node rather than
-provider-wide. Re-probe before relying on either.
+Qwen3 8 27B and Qwen3 6 35B A3B are back. An earlier revision of this table marked them as failing DCAP with `unacceptable TCB status OutOfDate`; the nodes have since been updated and both now attest and complete tool round trips. That is the other half of the earlier note: the failure was per node, and it was fixed by Venice rather than by anything here.
+
+Not in the table: models that do not advertise function calling. `e2ee-gemma-4-26b-a4b-uncensored-p`, `e2ee-qwen-2-5-7b-p` and `e2ee-gpt-oss-120b-p` also completed a prompt-based tool round trip in the 2026-11-06 probe (GPT-OSS with the GPU gate off; as of 2026-11-12 Gemma no longer serves GPU evidence either), but see the next paragraph for why that is not a feature to build on.
 
 Check `supportsFunctionCalling` on `/models` before relying on tools. The two paths disagree about what happens when it is `false`. TEE-only refuses, because `tools` is a real request parameter and Venice rejects it with `400 "tools is not supported by this model"`, so you find out immediately. E2EE appears to work, because schemas travel inside the prompt and Venice's capability check never sees them. A model without native tool support can emit well-formed `<tool_call>` blocks that this proxy parses into real `tool_calls`, and still be useless: never having been trained for the round trip, it echoes the `<tool_response>` back instead of answering it.
 
 So the prompt-based path is not a way to add function calling to models that lack it. It is a way to keep function calling private on models that have it.
 
-Two more advertise function calling and are still not usable, each for its own reason, both upstream of this proxy. `e2ee-kimi-k2-6` fails at the door: `/tee/attestation` returns 502, so no session can be established on either path. `e2ee-qwen3-vl-30b-a3b-p` attests fine and then refuses the tools themselves — Venice's backend answers `400 "auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set`, a vLLM that was started without tool parsing. Re-probe both before adding them; neither failure is anything a client can work around.
+`e2ee-kimi-k2-6` is still down: `/tee/attestation` returns 502, so no session can be established on either path (re-checked 2026-11-12). `e2ee-qwen3-vl-30b-a3b-p` is a different case. It attests, and on the `e2ee-` path tool calls now work because they never reach Venice's backend as a `tools` parameter. Venice's backend was previously answering `400 "auto" tool choice requires --enable-auto-tool-choice`, which still describes what a native `tee-` request would hit, so the `tee-` variant is untested and not recommended.
 
 Kimi K3 fails in a third way, and only halfway. On `tee-` it is fine: native tool calls, and a tool result fed back produces an answer that uses it. On `e2ee-` the first call works — the model emits a well-formed `<tool_call>` block and the parser returns it — and then the next request dies. Any conversation carrying a `tool`-role message comes back `400 "The request was rejected as invalid"`, reproducibly, where `e2ee-glm-5-3-p`, `e2ee-glm-5-3-flash` and `e2ee-deepseek-v4-flash` accept the identical payload. So a single tool call round-trips as far as your client, and the agent loop stops on the turn that would use the result. Use `tee-e2ee-kimi-k3-p` for anything with tools in it.
 
-Venice's E2EE gateway drops the `tools` request parameter, so a request carrying encrypted messages reaches the model with no schemas attached. The same model returns native tool calls when the E2EE headers are absent, so this is a property of the encrypted path rather than the model. Venice's own documentation now says as much — its E2EE limitations table lists `Function calling: Not supported`, alongside web search, file uploads and the Venice system prompt. Nothing rejects the parameter, though: the request returns `200` and the model answers that it has no tools, so a client that passes `tools` gets prose instead of an error. Passing `tools` through would have been the worst of both worlds: the model would ignore your tools while their names, descriptions and schemas travelled to Venice in plaintext.
+Venice's E2EE gateway drops the `tools` request parameter, so a request carrying encrypted messages reaches the model with no schemas attached. The same model returns native tool calls when the E2EE headers are absent, so this is a property of the encrypted path rather than the model. Venice's documentation has softened since: its E2EE limitations table now reads `Function calling: Depends on the model (check supportsFunctionCalling in /models). Tool definitions are not encrypted.` That describes sending tool definitions in plaintext next to encrypted messages. Re-tested 2026-11-06 by sending `tools` with E2EE headers straight to Venice, bypassing the proxy, on `e2ee-deepseek-v4-flash`, `e2ee-deepseek-v4-1-flash-1017-abliterated`, `e2ee-glm-5-3-p` and `e2ee-glm-5-3-flash`: all returned 200, none returned a `tool_calls` delta (the stream carried only `role`, `content` and `reasoning_content`), and every model replied that it had no tools. So native function calling over E2EE still does not exist, and the table's wording does not change that. Nothing rejects the parameter, though: the request returns `200` and the model answers that it has no tools, so a client that passes `tools` gets prose instead of an error. Passing `tools` through would have been the worst of both worlds: the model would ignore your tools while their names, descriptions and schemas travelled to Venice in plaintext.
 
-So the proxy moves function calling inside the encrypted channel. Schemas are rendered into a system message and encrypted with the rest of the conversation. The model's `<tool_call>` blocks are parsed out of the decrypted stream and converted back into OpenAI `tool_calls`. Prior `tool_calls` and `tool` results in your history are folded into encrypted message content, and the plaintext `tool_calls` field is dropped before the request leaves. The test suite asserts that none of them reach the wire.
+So the proxy moves function calling inside the encrypted channel. Schemas are rendered into text, appended to the single merged system message (see [System messages](#system-messages)) and encrypted with the rest of the conversation. The model's `<tool_call>` blocks are parsed out of the decrypted stream and converted back into OpenAI `tool_calls`. Prior `tool_calls` and `tool` results in your history are folded into encrypted message content, and the plaintext `tool_calls` field is dropped before the request leaves. The test suite asserts that none of them reach the wire.
 
 Two consequences: tool calling is prompt-driven rather than constrained decoding, so validate arguments before acting on them; and requests carrying tools cost extra prompt tokens for the injected schemas.
 
@@ -645,7 +679,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:3000/v1", api_key="unused")
 response = client.chat.completions.create(
-    model="e2ee-glm-5-3-p",
+    model="e2ee-glm-5-3-flash",
     messages=[{"role": "user", "content": "Hello!"}],
 )
 print(response.choices[0].message.content)
@@ -668,21 +702,21 @@ Concurrent requests are safe. Sessions are cached per model and shared, since en
       "name": "Venice E2EE Proxy",
       "options": { "baseURL": "http://127.0.0.1:5656/v1", "apiKey": "unused" },
       "models": {
-        "tee-e2ee-glm-5-3-p": {
-          "name": "GLM 5.3 (TEE)",
-          "tool_call": true, "reasoning": true, "attachment": false,
+        "tee-e2ee-glm-5-3-flash": {
+          "name": "GLM 5.3 Flash (TEE)",
+          "tool_call": true, "reasoning": true, "attachment": true,
           "limit": { "context": 1000000, "output": 32768 },
-          "cost": { "input": 1.75, "output": 5.5 }
+          "cost": { "input": 0.16, "output": 0.54 }
         }
       }
     }
   },
-  "model": "venice-e2ee/tee-e2ee-glm-5-3-p",
+  "model": "venice-e2ee/tee-e2ee-glm-5-3-flash",
   "small_model": "venice-e2ee/tee-e2ee-glm-5-3-flash"
 }
 ```
 
-[`opencode.example.json`](opencode.example.json) has the list worth offering in a picker, each in both `tee-` and `e2ee-` form: the models above, minus any that a sibling strictly dominates. `e2ee-glm-5-2-p` is the one left out — GLM 5.3 matches its input price with cheaper output and twice the context, so nothing would ever select it. It still works, which is why it stays in the table. The `tee-` variants are the defaults because Venice's native function calling works on that path, while the `e2ee-` path's prompt-based parsing is best-effort. The `e2ee-` entries stay selectable for non-tool or maximum-privacy turns.
+[`opencode.example.json`](opencode.example.json) has the list worth offering in a picker, each in both `tee-` and `e2ee-` form: the models above, minus any that a sibling strictly dominates. The file also lists `e2ee-glm-5-3-p`, whose GPU evidence depends on the node, so under the default config some of its sessions are refused (see the table above). `e2ee-glm-5-2-p` is the one left out — GLM 5.3 matches its input price with cheaper output and twice the context, so nothing would ever select it, and it serves no GPU evidence at all. It stays in the table because it still works with the gate off. The default is `tee-e2ee-glm-5-3-flash`, the GLM that serves GPU evidence. The `tee-` variants are the defaults because Venice's native function calling works on that path, while the `e2ee-` path's prompt-based parsing is best-effort. The `e2ee-` entries stay selectable for non-tool or maximum-privacy turns.
 
 `tee-e2ee-kimi-k3-p` is in that file but is not the default, and it is the one entry that will not work against a stock proxy — it needs `verify_gpu_attestation: false`, for the reasons in [GPU attestation](#gpu-attestation). Left as the default it would break every session on a config that has the gate on, which is the config the rest of this README recommends. Selecting it is a decision; inheriting it silently should not be. It ships without an `e2ee-` sibling too: that path cannot carry a tool result, and an entry that dies on the second turn of every agent loop is worse than an absent one.
 
