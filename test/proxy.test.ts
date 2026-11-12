@@ -797,6 +797,129 @@ describe('E2EE with Venice error responses', () => {
   });
 });
 
+describe('E2EE with corrupted or truncated Venice responses', () => {
+  let mockVenice: http.Server;
+  let proxyServer: http.Server;
+  let sessionManager: ReturnType<typeof createServer>['sessionManager'];
+  let scenario: 'tampered' | 'plaintext' | 'malformed' | 'truncated' | 'aborted';
+
+  // Flip the last hex digit, which lands in the AES-GCM tag.
+  const tamper = (hex: string): string => hex.slice(0, -1) + (hex.endsWith('0') ? '1' : '0');
+
+  beforeAll(async () => {
+    mockVenice = http.createServer((req, res) => {
+      if (req.method === 'GET' && req.url?.startsWith('/api/v1/tee/attestation')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          verified: true,
+          nonce: new URL(`http://localhost${req.url}`).searchParams.get('nonce'),
+          model: 'e2ee-qwen3-30b-a3b-p',
+          signing_key: mockTeeKeypair.pubKeyHex,
+          server_verification: {
+            tdx: { valid: true },
+            signingAddressBinding: { bound: true },
+            nonceBinding: { bound: true },
+            verifiedAt: new Date().toISOString(),
+            verificationDurationMs: 100,
+          },
+        }));
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/api/v1/chat/completions') {
+        req.resume();
+        req.on('end', async () => {
+          const clientPubKey = req.headers['x-venice-tee-client-pub-key'] as string;
+          // Resolves once the event is in the socket, so the abort below drops the
+          // connection mid-stream rather than before the proxy has seen a 200.
+          const send = (content: string): Promise<void> => new Promise(resolve => {
+            res.write(`data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: null }] })}\n\n`, () => resolve());
+          });
+
+          res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+          await send(await encryptForClient(clientPubKey, 'Hello'));
+
+          if (scenario === 'truncated') return void res.end();
+          if (scenario === 'aborted') return void res.destroy();
+
+          if (scenario === 'tampered') await send(tamper(await encryptForClient(clientPubKey, ' from')));
+          if (scenario === 'plaintext') await send(' from');
+          if (scenario === 'malformed') res.write('data: {"choices":[{"delta":{"content":"04ab\n\n');
+
+          await send(await encryptForClient(clientPubKey, ' E2EE'));
+          res.write('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n');
+          res.write('data: [DONE]\n\n');
+          res.end();
+        });
+        return;
+      }
+
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise<void>(resolve => mockVenice.listen(0, '127.0.0.1', resolve));
+
+    const mockAddress = mockVenice.address() as { port: number };
+    const config = testConfig({
+      venice_base_url: `http://127.0.0.1:${mockAddress.port}`,
+      verify_attestation: false,
+    });
+    const result = createServer(config);
+    sessionManager = result.sessionManager;
+    proxyServer = result.app.listen(0, '127.0.0.1');
+    await new Promise<void>(resolve => proxyServer.once('listening', resolve));
+  });
+
+  afterAll(async () => {
+    sessionManager.destroy();
+    await Promise.all([
+      new Promise<void>(resolve => proxyServer.close(() => resolve())),
+      new Promise<void>(resolve => mockVenice.close(() => resolve())),
+    ]);
+  });
+
+  // A broken stream must end, not hang the client; the timeout turns a hang into a failure.
+  async function post(stream: boolean): Promise<{ status: number; body: string }> {
+    const address = proxyServer.address() as { port: number };
+    const res = await fetch(`http://127.0.0.1:${address.port}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'e2ee-qwen3-30b-a3b-p',
+        messages: [{ role: 'user', content: 'Hello' }],
+        stream,
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+    return { status: res.status, body: await res.text() };
+  }
+
+  const scenarios = ['tampered', 'plaintext', 'malformed', 'truncated', 'aborted'] as const;
+
+  for (const s of scenarios) {
+    it(`fails a non-streaming request with 502 when the response is ${s}`, async () => {
+      scenario = s;
+      const res = await post(false);
+      expect(res.status).toBe(502);
+      expect(JSON.parse(res.body).error.type).toBe('proxy_error');
+    });
+
+    it(`ends a streaming response with an error event and no [DONE] when it is ${s}`, async () => {
+      scenario = s;
+      const res = await post(true);
+      const events = res.body
+        .split('\n')
+        .filter(line => line.startsWith('data: '))
+        .map(line => line.slice(6));
+
+      expect(events).not.toContain('[DONE]');
+      const last = JSON.parse(events[events.length - 1]);
+      expect(last.error.type).toBe('proxy_error');
+      expect(events.some(e => JSON.parse(e).choices?.[0]?.finish_reason)).toBe(false);
+    });
+  }
+});
+
 describe('TEE-only requests (tee- prefix)', () => {
   let mockVenice: http.Server;
   let proxyServer: http.Server;

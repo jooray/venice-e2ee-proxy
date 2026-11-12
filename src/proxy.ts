@@ -674,6 +674,17 @@ export class ProxyHandler {
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
 
+      // Once a stream has started the 200 is already on the wire, so neither a
+      // retry nor a 502 is possible. End it with an error event and no [DONE], so
+      // the client sees a failure rather than a short answer.
+      if (res.headersSent) {
+        logger.error(`E2EE stream failed after it started: ${message}`);
+        if (!res.writableEnded) {
+          res.end(`data: ${JSON.stringify({ error: { message: `E2EE proxy error: ${message}`, type: 'proxy_error' } })}\n\n`);
+        }
+        return;
+      }
+
       // Auto-retry once on stale session
       if (!retried && message.includes('session may be stale')) {
         logger.warn(`Stale session detected for ${modelId}, retrying with fresh session`);
@@ -726,25 +737,22 @@ export class ProxyHandler {
           if (!line.startsWith('data: ')) continue;
           const data = line.slice(6).trim();
           if (data === '[DONE]') return;
+          // An event that does not parse may have carried ciphertext, so skipping
+          // it could lose part of the answer without anything noticing.
+          let event: unknown;
           try {
-            yield JSON.parse(data);
+            event = JSON.parse(data);
           } catch {
-            // skip malformed events
+            throw new Error('Venice sent a malformed stream event');
           }
+          yield event;
         }
       }
 
-      // Trailing event without a newline terminator
-      if (buffer.startsWith('data: ')) {
-        const data = buffer.slice(6).trim();
-        if (data && data !== '[DONE]') {
-          try {
-            yield JSON.parse(data);
-          } catch {
-            // ignore partial JSON
-          }
-        }
-      }
+      // [DONE] may arrive without a trailing newline. Without it at all, the
+      // stream was cut short and what was collected is not the full response.
+      if (buffer.trim() === 'data: [DONE]') return;
+      throw new Error('Venice stream ended without [DONE]; the response is truncated');
     } finally {
       reader.releaseLock();
     }
@@ -753,17 +761,22 @@ export class ProxyHandler {
   /**
    * Decrypt one hex field from a delta, mapping stale-session failures onto the
    * retry path in handleE2EERequest.
+   *
+   * Every failure is fatal. A chunk that does not decrypt is missing from the
+   * answer, so dropping it would hand the client an incomplete response as if
+   * it were whole.
    */
-  private async decryptField(privateKey: Uint8Array, value: string): Promise<string | null> {
+  private async decryptField(privateKey: Uint8Array, value: string): Promise<string> {
     try {
       return await decryptSingleChunk(privateKey, value);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      if (msg.includes('session may be stale') || msg.includes('OperationError')) {
+      // A failed AES-GCM tag check is a DOMException named OperationError; its
+      // message does not say so.
+      if ((e as { name?: unknown })?.name === 'OperationError' || msg.includes('session may be stale')) {
         throw new Error('E2EE decryption failed — session may be stale. Clear the session and retry.');
       }
-      logger.debug(`Chunk decrypt issue (non-fatal): ${msg}`);
-      return null;
+      throw new Error(`E2EE decryption failed: ${msg}`);
     }
   }
 
@@ -841,7 +854,6 @@ export class ProxyHandler {
 
       if (typeof delta.content === 'string' && delta.content) {
         const text = await this.decryptField(session.privateKey, delta.content);
-        if (text === null) continue;
         rawParts.push(text);
 
         if (parser) {
