@@ -574,7 +574,7 @@ The top-level secp256k1 `signature` over `<request-hash>:<response-hash>` in the
 
 > For agent workloads use the `tee-` prefix rather than `e2ee-`. Function calling over E2EE is best-effort and fails often enough to be unusable for anything chaining tool calls. See [E2EE tool calling is best-effort](#e2ee-tool-calling-is-best-effort).
 
-Pass `tools` and `tool_choice` exactly as with the OpenAI API. Verified end to end against the live API on both paths. Venice adds and drops models often, so treat this table as a snapshot and get the current ids from `/models`:
+Pass `tools` and `tool_choice` exactly as with the OpenAI API. Verified end to end against the live API on both paths. Venice adds and drops models often, so treat this table as a snapshot and get the current ids from `GET /v1/models`:
 
 | Model | Tools | Vision | Context | Output | $ in / M | $ out / M |
 |---|---|---|---|---|---|---|
@@ -672,7 +672,7 @@ VENICE_PROXY_DEBUG_DUMP=/tmp/venice-dump.jsonl npm run dev
 
 ## Clients
 
-The proxy exposes an OpenAI-compatible API on `POST /v1/chat/completions` and `POST /chat/completions`, plus `GET /health`. Any OpenAI-compatible client works:
+The proxy exposes an OpenAI-compatible API on `POST /v1/chat/completions` and `POST /chat/completions`, a model catalog on `GET /v1/models` (also `GET /models`), plus `GET /health`. Any OpenAI-compatible client works:
 
 ```python
 from openai import OpenAI
@@ -684,6 +684,8 @@ response = client.chat.completions.create(
 )
 print(response.choices[0].message.content)
 ```
+
+`GET /v1/models` is a passthrough to Venice's catalog using the proxy's key. The ids it returns are **Venice's own, unprefixed ids** (`glm-5-3-flash`, not `e2ee-glm-5-3-flash`), exactly as Venice sends them; nothing is renamed or added. Sending one of them back to `/v1/chat/completions` therefore reaches the plaintext passthrough path, not E2EE. Add the `e2ee-` prefix yourself when you want the encrypted path — the catalog cannot tell you which models have an E2EE endpoint, and the proxy will not guess.
 
 Function calling uses the ordinary OpenAI tool loop: pass `tools`, read `msg.tool_calls`, append a `{"role": "tool", "tool_call_id": ...}` message with your result, and call again. Tool calls come back in standard form, and streaming delivers them as `delta.tool_calls` followed by a `finish_reason: "tool_calls"` chunk.
 

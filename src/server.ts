@@ -59,11 +59,37 @@ export function createServer(config: ProxyConfig) {
     }
   });
 
+  // Model catalog - OpenAI compatible. Lists Venice's own models, not E2EE
+  // aliases; see handleModels() for why the ids are forwarded as they arrive.
+  app.get('/v1/models', async (req: Request, res: Response) => {
+    try {
+      await proxyHandler.handleModels(req, res);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error(`Unhandled error: ${message}`);
+      if (!res.headersSent) {
+        res.status(500).json({ error: { message: 'Internal proxy error', type: 'proxy_error' } });
+      }
+    }
+  });
+
+  app.get('/models', async (req: Request, res: Response) => {
+    try {
+      await proxyHandler.handleModels(req, res);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error(`Unhandled error: ${message}`);
+      if (!res.headersSent) {
+        res.status(500).json({ error: { message: 'Internal proxy error', type: 'proxy_error' } });
+      }
+    }
+  });
+
   // 404 for everything else
   app.use((_req: Request, res: Response) => {
     res.status(404).json({
       error: {
-        message: 'Not found. Available endpoints: POST /v1/chat/completions, GET /health',
+        message: 'Not found. Available endpoints: POST /v1/chat/completions, GET /v1/models, GET /health',
         type: 'invalid_request_error',
       },
     });
