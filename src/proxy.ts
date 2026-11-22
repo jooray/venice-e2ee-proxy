@@ -176,13 +176,14 @@ function warnAboutE2EEToolCalling(modelId: string): void {
 }
 
 /**
- * Core proxy handler for /v1/chat/completions.
+ * Core proxy handler for chat completions and the model catalog.
  *
  * Routes:
  * - TEE-only models (tee-*): verify attestation, forward plaintext with the
  *   prefix stripped, leave function calling to Venice
  * - E2EE models (e2ee-*): encrypt messages, forward to Venice, decrypt response
  * - Everything else: transparently forward with Authorization header
+ * - GET /v1/models and /models: forward Venice's catalog; see handleModels()
  */
 export class ProxyHandler {
   private sessionManager: SessionManager;
@@ -1049,6 +1050,50 @@ export class ProxyHandler {
       const message = err instanceof Error ? err.message : String(err);
       logger.error(`Passthrough request failed: ${message}`);
       res.status(502).json({ error: { message: `Proxy error: ${message}`, type: 'proxy_error' } });
+    }
+  }
+
+  /**
+   * Passthrough for `GET /v1/models`: Venice's OpenAI-compatible model catalog.
+   *
+   * Forwarded rather than answered locally, because the proxy has no list of its
+   * own and a hardcoded one would be wrong the next time Venice adds or retires a
+   * model. The response is not rewritten either: the ids are Venice's own,
+   * unprefixed ones, so a client that discovers a model here and sends it back
+   * lands on the plaintext passthrough path above. That is the honest mapping —
+   * E2EE is requested by the `e2ee-` prefix, and this endpoint cannot know
+   * whether it is supported.
+   *
+   * Status and `content-type` are forwarded, and nothing else. In particular
+   * `content-encoding` and `content-length` are not: `fetch` has already decoded
+   * the body, so copying them makes the response unparseable at the client.
+   */
+  async handleModels(req: Request, res: Response): Promise<void> {
+    const base = this.config.venice_base_url.replace(/\/$/, '');
+    const queryIndex = req.originalUrl.indexOf('?');
+    const query = queryIndex >= 0 ? req.originalUrl.slice(queryIndex) : '';
+    const veniceUrl = `${base}/api/v1/models${query}`;
+
+    try {
+      const headers: Record<string, string> = {
+        'Authorization': `Bearer ${this.config.venice_api_key}`,
+      };
+      if (req.headers.accept) headers['Accept'] = req.headers.accept as string;
+
+      const veniceRes = await fetch(veniceUrl, { method: 'GET', headers });
+
+      res.status(veniceRes.status);
+      const contentType = veniceRes.headers.get('content-type');
+      if (contentType) res.setHeader('Content-Type', contentType);
+
+      const text = await veniceRes.text();
+      res.send(text);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error(`Models list request failed: ${message}`);
+      if (!res.headersSent) {
+        res.status(502).json({ error: { message: `Proxy error: ${message}`, type: 'proxy_error' } });
+      }
     }
   }
 }

@@ -5,6 +5,7 @@ import type { Express } from 'express';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { gzipSync } from 'node:zlib';
 import { generateKeypair, deriveAESKey, encryptMessage, decryptChunk } from 'venice-e2ee';
 
 // Generate a valid secp256k1 keypair for the mock TEE
@@ -164,6 +165,41 @@ describe('Passthrough (non-E2EE) requests', () => {
   beforeAll(async () => {
     // Create a mock Venice API server
     mockVenice = http.createServer((req, res) => {
+      if (req.method === 'GET' && req.url?.startsWith('/api/v1/models')) {
+        const auth = req.headers['authorization'];
+        if (!auth || !auth.includes('test-key')) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'Unauthorized' } }));
+          return;
+        }
+        if (req.url.includes('deny=1')) {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'Rate limit exceeded' } }));
+          return;
+        }
+        const payload = JSON.stringify({
+          object: 'list',
+          data: [
+            { id: 'qwen3-30b-a3b-p', object: 'model', type: 'text' },
+            { id: 'glm-5-3-flash', object: 'model', type: 'text' },
+          ],
+        });
+        if (req.url.includes('gzip=1')) {
+          // Venice's CDN can compress the catalog. `fetch` decodes it before the
+          // proxy sees it, so a handler that copied content-encoding would hand
+          // the client a decoded body labelled as gzip.
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Content-Encoding': 'gzip',
+          });
+          res.end(gzipSync(payload));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(payload);
+        return;
+      }
+
       if (req.method === 'POST' && req.url === '/api/v1/chat/completions') {
         let body = '';
         req.on('data', chunk => body += chunk);
@@ -237,6 +273,41 @@ describe('Passthrough (non-E2EE) requests', () => {
     expect(res.status).toBe(200);
     const body = JSON.parse(res.body);
     expect(body.choices[0].message.content).toBe('Hello world');
+  });
+
+  it('forwards GET /v1/models to Venice with authorization', async () => {
+    const res = await request(proxyServer, 'GET', '/v1/models');
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toContain('application/json');
+    const body = JSON.parse(res.body);
+    expect(body.object).toBe('list');
+    // Venice's own ids, unprefixed: the proxy does not invent or rename models.
+    expect(body.data.map((m: { id: string }) => m.id)).toEqual(['qwen3-30b-a3b-p', 'glm-5-3-flash']);
+  });
+
+  it('forwards GET /models to the same Venice models list', async () => {
+    const res = await request(proxyServer, 'GET', '/models');
+    expect(res.status).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.data[0].id).toBe('qwen3-30b-a3b-p');
+  });
+
+  it('forwards the upstream status and content-type when the catalog request fails', async () => {
+    const res = await request(proxyServer, 'GET', '/v1/models?deny=1');
+    expect(res.status).toBe(429);
+    expect(res.headers['content-type']).toContain('application/json');
+    const body = JSON.parse(res.body);
+    expect(body.error.message).toContain('Rate limit');
+  });
+
+  it('returns a decoded body and does not copy content-encoding', async () => {
+    const res = await request(proxyServer, 'GET', '/v1/models?gzip=1');
+    expect(res.status).toBe(200);
+    // fetch already decoded the upstream gzip, so forwarding the header (or
+    // content-length) would leave the client with a body it cannot parse.
+    expect(res.headers['content-encoding']).toBeUndefined();
+    const body = JSON.parse(res.body);
+    expect(body.object).toBe('list');
   });
 
   it('forwards streaming non-E2EE request', async () => {
