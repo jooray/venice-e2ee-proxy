@@ -72,6 +72,27 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 
 Node.js 20+ and a [Venice AI](https://venice.ai) API key are required. If you cloned without `--recurse-submodules`, run `git submodule update --init --recursive` first. For production, `npm run build && npm start`.
 
+## Running with Docker
+
+You need [Docker](https://docs.docker.com/get-docker/) with Compose v2 (`docker compose`).
+
+```bash
+cp .env.example .env      # then set VENICE_API_KEY
+docker compose up -d --build
+curl http://127.0.0.1:3000/health
+```
+
+The image is built by cloning the repository at `VENICE_PROXY_REF` **inside the builder**, not by copying this checkout. That is what makes the `venice-e2ee` submodule work without the caller initialising it, and it means uncommitted local changes are never in the image: push and point the ref at the commit to test a change.
+
+`VENICE_PROXY_REF` is a full commit SHA, set uncommented in `.env.example`, so the same checkout builds the same image. Set it to a branch or tag to move it, and run `scripts/update-venice-proxy-ref.sh [branch]` to write the current tip of `main` into the Dockerfile, `docker-compose.yml` and `.env.example` together. Tracking `main` needs `docker compose build --no-cache`: the clone layer is cached against the unchanged build argument, so `--build` alone keeps whatever tip was fetched first. `VENICE_PROXY_REPO` points the build at a fork.
+
+The container listens on `0.0.0.0:3000` and Compose publishes it on `127.0.0.1` only, since the proxy holds an API key and authenticates nothing. It runs as the unprivileged `node` user with a read-only root filesystem, `/tmp` as tmpfs, all capabilities dropped and `no-new-privileges`. Receipt anchors (`VERIFY_RECEIPTS=true`) are written to `/data`, a named volume, because `/app` is not writable by that user.
+
+```bash
+docker compose down       # stop; the anchor volume is kept
+docker compose down -v    # also delete the anchor volume
+```
+
 ## Configuration
 
 Settings come from `config.yaml` (optional), overridden by environment variables. `.env` loads automatically.
