@@ -22,7 +22,7 @@ services:
       dockerfile: Dockerfile
       args:
         VENICE_PROXY_REPO: ${VENICE_PROXY_REPO:-https://github.com/jooray/venice-e2ee-proxy.git}
-        VENICE_PROXY_REF: ${VENICE_PROXY_REF:-4b5602ef6a4d18e5379d9d866fd375ba24cefd2f}
+        VENICE_PROXY_REF: ${VENICE_PROXY_REF:-f705eaa338f4d281113a39074916a288dae6bc40}
     env_file:
       - .env
     environment:

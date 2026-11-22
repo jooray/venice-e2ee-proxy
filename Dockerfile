@@ -23,7 +23,7 @@ ARG VENICE_PROXY_REPO=https://github.com/jooray/venice-e2ee-proxy.git
 # A commit, not a branch tip, so `docker compose build` is reproducible by
 # default. scripts/update-venice-proxy-ref.sh rewrites this line together with
 # the defaults in docker-compose.yml and .env.example.
-ARG VENICE_PROXY_REF=4b5602ef6a4d18e5379d9d866fd375ba24cefd2f
+ARG VENICE_PROXY_REF=f705eaa338f4d281113a39074916a288dae6bc40
 
 WORKDIR /app
 
