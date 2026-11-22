@@ -1,0 +1,51 @@
+# From this directory:
+#
+#   cp .env.example .env    # then set VENICE_API_KEY
+#   docker compose up -d --build
+#
+# The image is built by cloning VENICE_PROXY_REF inside the builder (see the
+# Dockerfile), so this checkout is not what gets built. That is what makes the
+# `venice-e2ee` submodule work; it also means uncommitted changes are not in
+# the image. Push them and set VENICE_PROXY_REF to that commit to test them.
+#
+# The ref defaults to a commit. With a commit the layer cache is correct: the
+# rebuilt image is that commit. With VENICE_PROXY_REF=main the clone layer is
+# cached against the unchanged ARG, so `--build` alone keeps the old tip —
+# force a refetch with `docker compose build --no-cache` when tracking a branch.
+
+services:
+  venice-e2ee-proxy:
+    build:
+      # Compose requires a context; the Dockerfile ignores it (.dockerignore
+      # denies the whole tree). Kept as `.` only to satisfy that requirement.
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VENICE_PROXY_REPO: ${VENICE_PROXY_REPO:-https://github.com/jooray/venice-e2ee-proxy.git}
+        VENICE_PROXY_REF: ${VENICE_PROXY_REF:-4b5602ef6a4d18e5379d9d866fd375ba24cefd2f}
+    env_file:
+      - .env
+    environment:
+      HOST: "0.0.0.0"
+      PORT: ${PORT:-3000}
+      RECEIPT_ANCHOR_STORE: /data/receipt-anchors.json
+    ports:
+      # Loopback only: the proxy holds an API key and authenticates nothing.
+      - "127.0.0.1:${PORT:-3000}:${PORT:-3000}"
+    volumes:
+      # Receipt anchors survive container replacement. Without a volume the
+      # store would be recreated on every `up`, silently losing pinned anchors.
+      - receipt-anchors:/data
+    # The image needs no write access except /data and /tmp.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    # No container_name: it would block `docker compose up --scale`.
+
+volumes:
+  receipt-anchors:

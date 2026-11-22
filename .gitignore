@@ -22,3 +22,9 @@ Thumbs.db
 # Logs
 *.log
 .venice-receipt-anchors.json
+
+# Compose: only docker-compose.yml is tracked; use another name for local
+# overrides (which may carry secrets)
+docker-compose*.yml
+docker-compose*.yaml
+!docker-compose.yml

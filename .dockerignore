@@ -1,0 +1,8 @@
+# The build context is deliberately unused: the Dockerfile clones the
+# repository at VENICE_PROXY_REF and checks out the `venice-e2ee` submodule, so
+# the image does not depend on the caller's working tree.
+#
+# Denying everything keeps .env (a real API key), node_modules, .git,
+# dist/ and build/ away from the build daemon regardless of what a future
+# Dockerfile tries to COPY.
+*
