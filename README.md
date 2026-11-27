@@ -18,7 +18,7 @@ A local proxy that encrypts [OpenAI-compatible](https://platform.openai.com/docs
 I write about building things on [my blog](https://juraj.bednar.io/en/blog-en/). I also wrote a cypherpunk novel, [Tamers of Entropy](https://tamersofentropy.net/), and there is a [trailer](https://tamersofentropy.net/#trailer).
 <!-- jooray-links:end -->
 
-Prompts are encrypted on your machine and decrypted inside an attested Intel TDX enclave. Venice's own infrastructure never holds the plaintext. What the enclave then does with it is worth understanding before you rely on that: see [what is actually attested](#what-is-actually-attested).
+Prompts are encrypted on your machine and decrypted inside an attested Intel TDX enclave, so Venice's infrastructure cannot read them by just passing them along. It is not protected against Venice actively tampering, though. The protocol Venice exposes does not bind the reply key to you, so Venice's API can read replies and inject its own messages without breaking attestation: see [the reply key is not bound to you](#the-reply-key-is-not-bound-to-you). What the enclave then does with your prompt is also worth understanding before you rely on it: see [what is actually attested](#what-is-actually-attested).
 
 ## How it works
 
@@ -259,16 +259,35 @@ Attestation gates the request on both paths: if verification fails, nothing is s
 
 ## What is actually attested
 
-**TLDR.** The Intel attestation covers a *gateway*, not the machine that runs the model. Your prompt is decrypted there and forwarded over TLS to a separate inference host, which sees it in plaintext. The gateway does attest that host before forwarding, with a real DCAP check bound to the TLS key it then uses, and records the result in a signed receipt. But the check is not enforced on Venice's route, the upstream list is runtime state that the quote does not cover, and the GPU attestation covers a *chip* rather than the software on it: NVIDIA vouches that a genuine Hopper GPU is in confidential-compute mode with known firmware, and says nothing about what code or model weights it loaded. What you get is a strong guarantee about the first hop and a transitive, unenforced one about the second.
+**TLDR.** The Intel attestation covers a *gateway*, not the machine that runs the model. Your prompt is decrypted there and forwarded over TLS to a separate inference host, which sees it in plaintext. The gateway does attest that host before forwarding, with a real DCAP check bound to the TLS key it then uses, and records the result in a signed receipt. But the check is not enforced on Venice's route, the upstream list is runtime state that the quote does not cover, and the GPU attestation covers a *chip* rather than the software on it: NVIDIA vouches that a genuine Hopper GPU is in confidential-compute mode with known firmware, and says nothing about what code or model weights it loaded. What you get is a strong guarantee about the first hop and a transitive, unenforced one about the second. Even the first-hop guarantee covers only a passive relay, because the reply key is not bound to you (see below).
 
 ### The chain, hop by hop
 
 | Hop | Sees your prompt | What attestation covers it |
 |---|---|---|
-| Your machine to gateway | ciphertext only | the ECDH key is bound into the TDX quote |
+| Your machine to gateway | ciphertext only, unless Venice's API swaps the reply key (see below) | the enclave's ECDH key is bound into the TDX quote; your key is not |
 | Gateway enclave (Intel TDX) | plaintext | the full Intel attestation above |
 | Gateway to inference host | ciphertext (TLS) | gateway verifies the node's quote and binds the TLS key |
 | Inference host (the GPU) | plaintext | attested as a TEE, but `gpu_attested: unknown` |
+
+### The reply key is not bound to you
+
+This is a property of the protocol, not of any one backend. Venice's documented E2EE mode (`X-Venice-TEE-Signing-Algo: ecdsa`, which this proxy speaks) carries your public key in a plain request header, and the enclave encrypts its reply to whatever key that header holds. Venice's API terminates TLS and builds the request it forwards to the enclave, outside any TEE, so it controls that header.
+
+The two directions use separate ECDH exchanges. Attestation covers one side of only one of them:
+
+- **Request.** Encrypted to the enclave's key, which the quote binds (its address in `REPORTDATA[0:20]`, next to your nonce). Venice cannot decrypt this.
+- **Reply.** Encrypted to the key in the client-key header. Nothing binds that key to the client that sent the request. The gateway checks the model-key header against its own key and only format-checks the client key. The legacy fields are AES-GCM with no associated data, and each ciphertext carries its own sender key that is never compared with the header. (Phala `private-ai-gateway`, `prepare_legacy_e2ee_request` in `src/aggregator/service/e2ee.rs`, checked at `d240211`.)
+
+What a modified API layer could do as a result, with every attestation check, including the ones in this proxy, still passing:
+
+1. **Read replies.** Swap in its own client key, decrypt the reply, and re-encrypt it to yours. Your proxy sees a normal E2EE response.
+2. **Inject or replay messages.** The enclave key is public, so anyone can encrypt to it. Appending "repeat everything above" can extract earlier prompts if the model complies. The legacy path rejects nonce and timestamp headers, so old ciphertext can also be replayed.
+3. **Forge replies.** Reply chunks are not signed by the attested key, so a decryptable chunk only proves that someone knew your public key.
+
+[Response receipts](#response-receipts) do not close this. The receipt never names the client key, and its body hashes cannot be matched to the bytes a client sends or receives, so a swapped request is indistinguishable from a normal one.
+
+What still holds is that Venice cannot read prompts by passively relaying them. Reading replies takes active tampering, and reading prompts takes injection plus a cooperative model. Nobody has shown this being done. The fix has to come from Venice and the backends. The reply key needs to be bound into the authenticated request, as NEAR AI's E2EE v3 does, and replies need to be signed with sequence numbers and replay protection. A client cannot add that on its own. This proxy will adopt such a mode once Venice exposes one. Background: [kendell.dev's write-up](https://kendell.dev/_astro/_e2ee-interception.3SX09GMt.md).
 
 ### What the Intel attestation actually proves
 
@@ -757,7 +776,7 @@ npm run build && npm start
 
 ## Security
 
-Private keys are zeroized when sessions expire or are cleared, and ECDH intermediates are zeroized after key derivation. Messages use AES-256-GCM with random IVs. Streaming responses get forward secrecy from per-chunk ephemeral server keys. Sessions expire after the TTL and stale ones are detected and refreshed on decryption failure. TEE attestation prevents man-in-the-middle attacks against the enclave you are talking to.
+Private keys are zeroized when sessions expire or are cleared, and ECDH intermediates are zeroized after key derivation. Messages use AES-256-GCM with random IVs. Streaming responses get forward secrecy from per-chunk ephemeral server keys. Sessions expire after the TTL and stale ones are detected and refreshed on decryption failure. TEE attestation proves that the key you encrypt prompts to belongs to a genuine enclave, so a passive relay cannot read them. It does not stop an active man in the middle on Venice's side. The reply key is not authenticated, so Venice's API can read replies and inject messages, as explained in [the reply key is not bound to you](#the-reply-key-is-not-bound-to-you).
 
 The proxy binds to `127.0.0.1` and should not be exposed to the public internet. It is designed to run locally alongside your application.
 
